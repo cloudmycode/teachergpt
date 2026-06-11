@@ -5,7 +5,7 @@
 结果按同样子目录结构保存到 chinese_text。
 
 支持多进程并行：
-  python3.13 script/transcribe_dir.py --workers 4
+  python3 script/transcribe_dir.py --workers 4
 
 原理：启动时扫描所有 mp3，过滤掉已有 txt 的；
 对剩余的用 multiprocessing.Pool 并行调用 transcribe.py，

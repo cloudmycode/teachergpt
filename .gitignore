@@ -1,6 +1,10 @@
 # 数据文件
 data/chinese_mp3/*
 data/chinese_text/*
+data/chinese_clean/*
+
+# 密钥配置（仅提交 config.example.toml）
+script/config.toml
 
 # Python
 __pycache__/
