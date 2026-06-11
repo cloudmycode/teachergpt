@@ -61,7 +61,7 @@ def process_one(args_tuple: tuple) -> tuple[str, str, str]:
 
     t0 = time.time()
     # 开始日志：在子进程内直接打印，flush=True 保证实时显示（主进程拿不到“开始”事件）
-    print(f"  ▶ [pid {os.getpid()}] {rel}  开始", flush=True)
+    print(f"  ▶ [{datetime.now():%H:%M:%S}] [pid {os.getpid()}] {rel}  开始", flush=True)
     ret = subprocess.run(
         [python_exe, str(TRANSCRIBER), str(mp3),
          "--out", str(out_dir), "--lang", lang],
