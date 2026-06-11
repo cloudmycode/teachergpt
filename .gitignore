@@ -1,5 +1,6 @@
 # 数据文件
-data/
+data/chinese_mp3/*
+data/chinese_text/*
 
 # Python
 __pycache__/

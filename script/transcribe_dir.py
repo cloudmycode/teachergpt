@@ -37,24 +37,26 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def process_one(args_tuple: tuple) -> tuple[str, bool, str]:
+def process_one(args_tuple: tuple) -> tuple[str, str, str]:
     """单个 mp3 的处理函数（在子进程中执行）。
 
     参数用 tuple 打包是因为 Pool.map 只接受单参数函数。
-    返回: (mp3 相对路径, 是否成功, 耗时字符串或错误信息)
+    返回: (mp3 相对路径, 状态(ok/fail/skip), 消息)
     """
     mp3, src, dst, out_dir, out_txt, lang, python_exe = args_tuple
     rel = mp3.relative_to(src)
 
-    # 占位：如果目标 txt 已存在（其他进程已处理完）则跳过
-    if out_txt.exists() and out_txt.stat().st_size > 0:
-        return (str(rel), "skip", "")
+    # 确保输出子目录存在（否则 touch 会抛 FileNotFoundError）
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 创建空文件占位，防止其他进程重复处理
+    # 严格占位：目标已存在（其他进程已占位/已完成）则跳过
+    if out_txt.exists():
+        return (str(rel), "skip", "")
     try:
+        # 原子创建空占位（底层 O_EXCL），抢到才处理
         out_txt.touch(exist_ok=False)
     except FileExistsError:
-        # 另一个进程已创建
+        # 另一个进程刚抢先创建
         return (str(rel), "skip", "")
 
     t0 = time.time()
@@ -77,25 +79,26 @@ def process_one(args_tuple: tuple) -> tuple[str, bool, str]:
         return (str(rel), "fail", f"耗时 {timedelta(seconds=int(dt))} | {err}")
 
 
+
+
+
 def build_tasks(src: Path, dst: Path, lang: str, python_exe: str) -> list[tuple]:
     """收集待处理任务，过滤已完成的。"""
     mp3_files = sorted(src.rglob("*.mp3"))
     if not mp3_files:
         return []
 
-    # 已完成的 stem 集合
-    done: set[str] = set()
-    for txt in dst.rglob("*.txt"):
-        if txt.stat().st_size > 0:  # 排除占位空文件
-            done.add(txt.stem)
-
     tasks = []
     for mp3 in mp3_files:
-        if mp3.stem in done:
-            continue
         rel = mp3.relative_to(src)
         out_dir = dst / rel.parent
         out_txt = out_dir / f"{mp3.stem}.txt"
+        # 按实际目标路径判断（避免不同子目录同名文件互相误判）
+        if out_txt.exists():
+            if out_txt.stat().st_size > 0:
+                continue  # 已完成
+            # 0 字节占位：上次中断遗留（此刻是单进程启动阶段，无 worker 在跑，安全删除重处理）
+            out_txt.unlink()
         tasks.append((mp3, src, dst, out_dir, out_txt, lang, python_exe))
     return tasks
 
@@ -130,20 +133,27 @@ def main() -> None:
     ok = 0
     fail = 0
     skip = 0
+    done_count = 0
+
+    def on_done(result: tuple):
+        """imap_unordered 结果回调风格的包装。"""
+        nonlocal ok, fail, skip, done_count
+        rel_str, status, msg = result
+        done_count += 1
+        if status == "ok":
+            ok += 1
+            print(f"  ✓ [{done_count}/{len(tasks)}] {rel_str}  {msg}")
+        elif status == "fail":
+            fail += 1
+            print(f"  ✗ [{done_count}/{len(tasks)}] {rel_str}  {msg}")
+        else:
+            skip += 1
+            print(f"  ⊘ [{done_count}/{len(tasks)}] {rel_str}  已被其他进程处理")
 
     with Pool(processes=workers) as pool:
-        # imap_unordered 让先完成的先打印，比 apply_async 更简洁
         results = pool.imap_unordered(process_one, tasks)
-        for rel_str, status, msg in results:
-            if status == "ok":
-                ok += 1
-                print(f"  ✓ [{ok+fail+skip}/{len(tasks)}] {rel_str}  {msg}")
-            elif status == "fail":
-                fail += 1
-                print(f"  ✗ [{ok+fail+skip}/{len(tasks)}] {rel_str}  {msg}")
-            else:
-                skip += 1
-                print(f"  ⊘ [{ok+fail+skip}/{len(tasks)}] {rel_str}  已被其他进程处理")
+        for result in results:
+            on_done(result)
 
     total = time.time() - start_all
     print(f"\n完成: 成功 {ok}, 失败 {fail}, 跳过 {skip}, "
