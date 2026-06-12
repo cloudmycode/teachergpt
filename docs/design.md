@@ -210,11 +210,19 @@
     "text": "...",
     "tags": ["字词", "情感", "重点段"],
     "summary": "讲解'蹒跚'一词，结合父亲爬月台的动作细节，引导学生体会父爱。",
-    "entities": ["朱自清", "背影", "蹒跚"]
+    "entities": ["朱自清", "背影", "蹒跚"],
+    "source_refs": [{"para": 6, "quote": "他蹒跚地走到铁道边，慢慢探身下去"}]
   }
   ```
 - `summary`：用大模型对长文本做一句话摘要（50字内），用于快速浏览和粗筛。
 - `entities`：从文本中抽实体（人名、地名、课文名、术语），便于按知识点过滤检索。
+- `source_refs`：本单元讲到/引用的**课文原文原句**，对应到课文段落号。作用有二：
+  1. **检索锚点**——用户 query 常是"讲《背影》第二段""讲蹒跚那句"，挂上原句和段落号后能按原文精确召回/过滤（配合 B.2 步骤3 的 `where={"lesson":...,"para":...}`），比只靠讲解文本的语义匹配更准。
+  2. **防幻觉素材**——生成时把权威原文一起喂给模型，避免它把课文背错、引错句子（呼应第 32 行的知识幻觉风险）。原文是"事实锚"，老师讲解是"风格锚"，两者分工。
+  - 角色定位：`source_refs` 是**附加锚点**，不替代 `text`（讲解文本仍是主体）。
+  - 抽取方式：在补 `summary/entities` 的同一次模型调用里，顺带让模型标出本单元引用的课文原句及所在段落。
+  - **前提**：DeepSeek 训练数据中已包含常见语文课文原文，可直接凭记忆标注，不依赖外部课文原文库。对不常见课文可能不准或留空，靠人工复核兜底。
+  - 对齐粒度：老师是跳着讲、引片段，不逐句念，所以做到**段落级 + 引用句**即可，不追求逐句严格对齐；拿不准的留空，靠下方"人工复核"环节顺带补。
 
 #### 步骤 4：导出为 JSONL
 - 每行一个 JSON 对象，便于后续批量向量化入库。
@@ -241,13 +249,24 @@
   "text": "今天我们来学《背影》，同学们想想，你有没有一个印象特别深的、关于家人的背影？先看几个字词，'踌躇'——大家注意这个'躇'读 chú……'蹒跚'两个字，你们体会一下，父亲爬月台那个样子……'他用两手攀着上面，两脚再向上缩'——这一句，每一个动词都……",
   "tags": ["导入", "字词", "情感", "重点段", "句析"],
   "summary": "导入课文，讲解'踌躇''蹒跚'等重点字词，结合父亲爬月台的动作细节分析父爱。",
-  "entities": ["朱自清", "背影", "蹒跚", "踌躇", "月台"]
+  "entities": ["朱自清", "背影", "蹒跚", "踌躇", "月台"],
+  "source_refs": [
+    {"para": 6, "quote": "他蹒跚地走到铁道边，慢慢探身下去"},
+    {"para": 6, "quote": "他用两手攀着上面，两脚再向上缩"}
+  ]
 }
 ```
 
 #### 工程化
-- 切分逻辑可写成一个脚本：读 JSONL → 按 tags 主题切换切分 → 补 summary/entities → 输出新的 JSONL。
-- 后续可加一个"人工复核"环节：随机抽 10% 切分结果，检查是否有不当切点（如把一个完整提问从中间切断）。
+- 切分逻辑可写成一个脚本：读 JSONL → 按 tags 主题切换切分 → 补 summary/entities/source_refs → 输出新的 JSONL。
+- `source_refs` 由 DeepSeek 凭训练数据记忆直接标注，不依赖外部课文原文库。对于不熟悉的课文可能不准或留空，靠抽检兜底。
+- 后续可加一个"人工复核"环节：随机抽 10% 切分结果，检查是否有不当切点（如把一个完整提问从中间切断），并顺带核对 `source_refs` 原句对应是否正确。
+
+> **已实现**：`script/split_units.py`。用法：
+>   `python3 script/split_units.py` — 处理全部；
+>   `python3 script/split_units.py --file xxx.jsonl` — 单文件；
+>   `python3 script/split_units.py --dry-run` — 仅切分不调模型；
+>   `python3 script/split_units.py --sample-check 0.1` — 切分后抽 10% 打印摘要供人工复核。
 
 ### A.3 风格画像（给 Prompt 和评估用）
 
@@ -268,6 +287,9 @@
 | 互动密度 | 单位时长内提问/呼唤学生的次数 | 每分钟互动 N 次 |
 
 这些数字本身就是阶段 6 评估里"风格保真度"的自动指标，一举两得。
+
+> **已实现**：`script/style_stats.py`。输出 `data/style/style_stats.json` 或 `--out stats.md`。
+> 用法：`python3 script/style_stats.py` | `--top-k 30` | `--out stats.md`。
 
 #### 第二条腿：大模型归纳（统计算不出的"套路"靠它）
 讲解结构、举例偏好、情感表达这类"软"特征，统计抽不出来，用大模型读真实片段归纳。
@@ -314,6 +336,9 @@
 - 跑分批归纳再合并：50 段一批跑几批，结果取交集/高频项，比一次塞太多更稳。
 - 这份档案是"活"的，阶段 B 上线后发现哪条风格没抓准，回来改档案即可，成本极低。
 
+> **已实现**：`script/style_profile.py`（第二条腿）。依赖 `script/style_stats.py` 先产出统计数据。
+> 用法：`python3 script/style_stats.py && python3 script/style_profile.py --batches 3 && python3 script/style_profile.py --merge` | `--samples 50` | `--dry-run`。
+
 #### 三个用途回顾
 1. **阶段 B Prompt**：整段塞进 System，告诉模型"你要这样说话"。
 2. **阶段 C 训练**：用"讲解结构""提问方式"等当 instruction 模板，构造训练对。
@@ -342,42 +367,47 @@
 - 别一上来就上 Milvus——那是千万级以上、要分布式才需要的，MVP 阶段是过度工程。
 
 #### 步骤 3：批量向量化入库
-- 读 A.2 产出的 JSONL，取每段的 `text` 字段。
-- 用 embedding 模型批量编码（batch_size=64），得到每个单元的向量。
-- 连同原文和元数据一起写入向量库。代码示例：
+
+**向量索引用 `text`（讲课全文）。**
+精确维度（课文/段落）靠元数据过滤，语义维度（概念/风格/讲法）靠 `text` 向量——两者分工。
+
+- 读 A.2 JSONL，编码 `text`。
+- metadata 里保存 lesson + tags + summary + para（从 source_refs 提取的段落号），用于精确过滤。
+- 代码示例：
 
 ```python
 from sentence_transformers import SentenceTransformer
 import chromadb, json
 
-# 1. 加载 embedding 模型（启动时加载一次，常驻）
 model = SentenceTransformer("BAAI/bge-large-zh-v1.5")
 
-# 2. 建/连接向量库集合
 client = chromadb.PersistentClient(path="./vecdb")
 col = client.get_or_create_collection(
-    name="teacher_segments",
-    metadata={"hnsw:space": "cosine"}   # 用余弦相似度
+    name="teacher_units",
+    metadata={"hnsw:space": "cosine"}
 )
 
-# 3. 读 A 产出的检索单元，批量向量化并入库（离线跑一次/增量跑）
-segments = [json.loads(l) for l in open("cleaned_segments.jsonl")]
-texts = [s["text"] for s in segments]
+units = [json.loads(l) for l in open("segments_all.jsonl")]
 
-# bge 建库侧不用加指令前缀，直接编码即可
+texts = [u["text"] for u in units]
 embeddings = model.encode(texts, normalize_embeddings=True, batch_size=64).tolist()
 
 col.add(
-    ids=[s["segment_id"] for s in segments],
+    ids=[u["unit_id"] for u in units],
     embeddings=embeddings,
-    documents=texts,                      # 存原文，检索后直接拿来用
-    metadatas=[{                          # 存元数据，用于定位/过滤
-        "lesson": s["lesson"],
-        "t_start": s["t_start"],
-        "tags": ",".join(s.get("tags", []))
-    } for s in segments]
+    documents=texts,
+    metadatas=[{
+        "lesson": u["lesson"],
+        "t_start": u["t_start"],
+        "tags": ",".join(u.get("tags", [])),
+        "summary": u.get("summary", ""),
+        "paras": ",".join(str(r["para"]) for r in u.get("source_refs", []) if "para" in r),
+    } for u in units]
 )
 ```
+
+> **已实现**：`script/build_index.py`（调度 `bge/encode.py` 的 Encoder）。
+> 用法：`python3 script/build_index.py`（增量）| `--rebuild`（重建）| `--dry-run` | `--model-dir ./bge/models`。
 
 #### 步骤 4：加 reranker（精排模型，强烈建议）
 向量召回（top-20）是"粗筛"，速度快但有时把不够相关的也召回了。再用 **`bge-reranker-v2-m3`** 这种交叉编码器，对 query 和每个候选段两两打分，重排后取真正最相关的 top-N（如 N=3~5）塞进 Prompt：
@@ -392,6 +422,8 @@ top = [doc for _, doc in sorted(zip(scores, hits["documents"][0]), reverse=True)
 ```
 
 "粗召回(向量, top-20) → 精排(reranker, top-5)"是 RAG 的标准两段式，能明显提升喂给 LLM 的上下文质量。
+
+> **已实现**：`script/search.py` 支持 `--rerank` 启用两段式检索。首次运行会下载 `bge-reranker-v2-m3`（~2.3GB）。
 
 #### 步骤 5：增量更新
 - 新转录的课随时 `col.add` 增量入库，不用全量重跑。
@@ -667,7 +699,10 @@ teacher-clone/
 │   ├── prompt_builder.py  # Prompt 组装
 │   └── style_profile.py   # 风格档案加载
 ├── data/                   # 静态数据
-│   ├── style_profile.json # 阶段 A.3 产出
+│   ├── style/             # 阶段 A.3 产出
+│   │   ├── style_stats.json
+│   │   ├── style_profile.json
+│   │   └── style_profile_batch_*.json
 │   ├── segments.jsonl     # 阶段 A.2 产出
 │   └── vecdb/             # Chroma 向量库（运行时生成）
 ├── models/                 # 模型权重

@@ -1,0 +1,16 @@
+# teachergpt Python 依赖
+# 安装全部：pip3 install -r requirements.txt
+
+# 文本转录 (script/transcribe_dir.py)
+faster-whisper>=1.0
+
+# 大模型调用 (script/clean_transcript.py, script/split_units.py)
+# 用标准库 urllib，无额外依赖
+
+# 风格统计 (script/style_stats.py)
+jieba>=0.42
+
+# 向量索引 (bge/)
+chromadb>=0.5
+sentence-transformers>=3.0
+huggingface-hub>=0.20
