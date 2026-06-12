@@ -1,7 +1,7 @@
 #!/usr/local/bin/python3.13
 # -*- coding: utf-8 -*-
 """
-转录清洗 pipeline：纠错 + 断句合并（一次大模型调用完成）。
+转录清洗 pipeline：纠错 + 断句合并 + 结构化标签（一次大模型调用完成）。
 
 输入：data/chinese_text/<课程>/<NNN-标题>.txt
       每行格式  start_time → end_time | 文本
@@ -9,10 +9,10 @@
 
 输出：data/chinese_clean/<课程>/<NNN-标题>.jsonl
       每行一个 JSON 段落对象：
-      {"lesson","segment_id","t_start","t_end","text"}
+      {"lesson","segment_id","t_start","t_end","text","tags"}
 
 核心：序号锚定法。送给模型的是「行号 + 纯文本」，模型只决定
-「哪几行合成一段 + 段内纠错后的文字」，并标出覆盖的行号区间 [a-b]；
+「哪几行合成一段 + 段内纠错后的文字 + 该段标签」，并标出覆盖的行号区间 [a-b]；
 时间戳由代码按行号区间从原始数据还原，模型绝不碰时间戳。
 对每个分块校验区间「连续、不重叠、全覆盖」，不通过则重试，
 重试仍失败则降级（该块保留原始行不合并），绝不静默吞行。
@@ -57,6 +57,9 @@ PAUSE_GAP = 0.8
 # 失败重试次数
 MAX_RETRY = 2
 
+# 步骤4 可选标签集合（design.md A.1 步骤4）
+TAG_SET = ("导入", "背景", "字词", "句析", "提问", "互动", "情感", "总结", "其他")
+
 # 常见错别字/专名词表（可按课程扩充）——放进 prompt 提示模型
 HINT_VOCAB = (
     "世说新语 刘义庆 阮籍 刘伶 咏雪 陈太丘与友期 志人小说 "
@@ -83,6 +86,7 @@ class Segment:
     t_start: float
     t_end: float
     text: str
+    tags: list[str]
 
 
 # ---------------------------------------------------------------- 配置加载
@@ -195,17 +199,20 @@ def build_user_prompt(lines: list[Line], base: int) -> str:
     lo, hi = base, base + len(lines) - 1
     return (
         f"下面是《世说新语》精读课的语音识别结果，每行前是行号 [{lo}] 到 [{hi}]。\n"
-        "请完成两件事：\n"
+        "请完成三件事：\n"
         "1. 纠正同音错别字，重点是书名/人名/典故，例如："
         "“诗说新语”→“世说新语”、“刘逸庆”→“刘义庆”、“软鸡”→“阮籍”、"
         "“流灵”→“刘伶”、“永雪”→“咏雪”、“智人小说”→“志人小说”。\n"
         "2. 把相邻碎句合并成通顺的段落，每段约 200~400 字，对应一个完整讲解动作。\n"
+        "3. 给每段打 1~3 个标签，从这些里选："
+        + "/".join(TAG_SET)
+        + "，多个用逗号分隔。\n"
         "规则：\n"
         "- 保留口头禅和语气（“大家好”“那首先呢”“对吧”），只删无意义的“嗯/呃”。\n"
         "- 每段必须以 [起-止] 开头标出覆盖的行号区间，区间要连续、不重叠、"
         f"且完整覆盖 [{lo}] 到 [{hi}] 的全部行，不得遗漏。\n"
         "- 单独一行也写成 [n-n]。\n"
-        "- 输出格式：每段一行，形如  [起-止] 整理后的段落文字\n"
+        "- 输出格式：每段一行，形如  [起-止] (标签1,标签2) 整理后的段落文字\n"
         f"【常见词表】{HINT_VOCAB}\n"
         "【转录】\n"
         f"{body}"
@@ -240,31 +247,45 @@ def call_deepseek(cfg: dict, user_prompt: str) -> str:
 
 # ---------------------------------------------------------------- 解析+校验模型输出
 
-SEG_RE = re.compile(r"^\s*\[\s*(\d+)\s*-\s*(\d+)\s*\]\s*(.*)$")
+SEG_RE = re.compile(
+    r"^\s*\[\s*(\d+)\s*-\s*(\d+)\s*\]\s*(?:[（(]([^）)]*)[）)])?\s*(.*)$"
+)
 
 
-def parse_model_output(content: str) -> list[tuple[int, int, str]]:
-    """解析模型输出为 (a, b, text) 列表。"""
-    out: list[tuple[int, int, str]] = []
+def _norm_tags(raw: str) -> list[str]:
+    """切分标签串，只保留 TAG_SET 内的合法标签，去重保序。"""
+    out: list[str] = []
+    for t in re.split(r"[,，、/\s]+", raw.strip()):
+        t = t.strip()
+        if t in TAG_SET and t not in out:
+            out.append(t)
+    return out or ["其他"]
+
+
+def parse_model_output(content: str) -> list[tuple[int, int, list[str], str]]:
+    """解析模型输出为 (a, b, tags, text) 列表。"""
+    out: list[tuple[int, int, list[str], str]] = []
     for raw in content.splitlines():
         m = SEG_RE.match(raw)
         if not m:
             continue
-        a, b, text = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        a, b = int(m.group(1)), int(m.group(2))
+        tags = _norm_tags(m.group(3) or "")
+        text = m.group(4).strip()
         if text:
-            out.append((a, b, text))
+            out.append((a, b, tags, text))
     return out
 
 
 def validate_coverage(
-    segs: list[tuple[int, int, str]], lo: int, hi: int
+    segs: list[tuple[int, int, list[str], str]], lo: int, hi: int
 ) -> bool:
     """校验区间连续、不重叠、完整覆盖 [lo, hi]。"""
     if not segs:
         return False
     ordered = sorted(segs, key=lambda x: x[0])
     cursor = lo
-    for a, b, _ in ordered:
+    for a, b, *_ in ordered:
         if a != cursor or b < a:
             return False
         cursor = b + 1
@@ -272,19 +293,19 @@ def validate_coverage(
 
 
 def to_segments(
-    parsed: list[tuple[int, int, str]], lines: list[Line], base: int
+    parsed: list[tuple[int, int, list[str], str]], lines: list[Line], base: int
 ) -> list[Segment]:
     """用行号区间从原始 lines 还原时间戳，生成 Segment。"""
     segs: list[Segment] = []
-    for a, b, text in sorted(parsed, key=lambda x: x[0]):
+    for a, b, tags, text in sorted(parsed, key=lambda x: x[0]):
         la, lb = a - base, b - base
-        segs.append(Segment(lines[la].start, lines[lb].end, text))
+        segs.append(Segment(lines[la].start, lines[lb].end, text, tags))
     return segs
 
 
 def fallback_segments(lines: list[Line]) -> list[Segment]:
-    """降级：不合并，原始行逐行（只去掉时间戳，文本不纠错）。"""
-    return [Segment(ln.start, ln.end, ln.text) for ln in lines]
+    """降级：不合并，原始行逐行（只去掉时间戳，文本不纠错，标签留空）。"""
+    return [Segment(ln.start, ln.end, ln.text, []) for ln in lines]
 
 
 # ---------------------------------------------------------------- 单文件处理
@@ -338,6 +359,7 @@ def clean_one(src_txt: Path, out_jsonl: Path, cfg: dict, dry_run: bool) -> str:
                 "t_start": round(seg.t_start, 2),
                 "t_end": round(seg.t_end, 2),
                 "text": seg.text,
+                "tags": seg.tags,
             }
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
     tmp.replace(out_jsonl)
@@ -394,6 +416,8 @@ def main() -> None:
 
     ok = skip = fail = 0
     t0 = time.time()
+    from datetime import datetime as _dt
+    print(f"开始时间: {_dt.now().isoformat(timespec='seconds')}")
     for i, txt in enumerate(txt_files, 1):
         rel = txt.relative_to(src)
         out_jsonl = dst / rel.with_suffix(".jsonl")
@@ -402,17 +426,20 @@ def main() -> None:
             skip += 1
             print(f"  ⊘ [{i}/{len(txt_files)}] {rel} 已存在，跳过")
             continue
-        print(f"  ▶ [{i}/{len(txt_files)}] {rel} 开始", flush=True)
+        print(f"  ▶ [{i}/{len(txt_files)}] {rel} 开始 @ {_dt.now().isoformat(timespec='seconds')}", flush=True)
+        t_file = time.time()
         try:
             msg = clean_one(txt, out_jsonl, cfg, args.dry_run)
+            dt_file = int(time.time() - t_file)
             ok += 1
-            print(f"  ✓ [{i}/{len(txt_files)}] {rel}  {msg}")
+            print(f"  ✓ [{i}/{len(txt_files)}] {rel}  {msg}  ({dt_file}s)")
         except Exception as e:  # noqa: BLE001  顶层兜底，单文件失败不影响整体
             fail += 1
             print(f"  ✗ [{i}/{len(txt_files)}] {rel}  {type(e).__name__}: {e}")
 
     dt = int(time.time() - t0)
-    print(f"\n完成: 成功 {ok}, 跳过 {skip}, 失败 {fail}, 耗时 {dt}s")
+    print(f"结束时间: {_dt.now().isoformat(timespec='seconds')}")
+    print(f"完成: 成功 {ok}, 跳过 {skip}, 失败 {fail}, 耗时 {dt}s")
 
 
 if __name__ == "__main__":
