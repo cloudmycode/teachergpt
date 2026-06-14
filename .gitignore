@@ -6,6 +6,7 @@ data/chinese_units/*
 data/vecdb/*
 data/style/*
 data/chinese_mp3_bak
+data/timelines/*
 
 # 密钥配置（仅提交 config.example.toml）
 script/config.toml

@@ -763,67 +763,342 @@ data: [DONE]
 
 ---
 
-## 8. TTS 音色克隆（可选独立线）
+## 11. 音视频 / PPT：讲解时原文高亮（句子 + 重点词）
 
-如果产品还要"声音也是他"，这是和文本生成**解耦**的子系统：文本生成给出讲稿 → TTS 朗读。
+### 11.1 目标
 
-### 8.1 数据准备
+讲解过程中原文跟着走——讲到哪一句就高亮哪一句，讲到哪个重点词就弹出释义。本质是做一份**讲解时间轴**：句级按段落天然对齐，词级通过强制对齐精确到字。
 
-- 输入：老师讲课的原始 mp3（就是 A 阶段用的那批）。
-- 处理步骤：
-  1. **切出干净人声片段**：用 Whisper 的词级时间戳定位老师说话的区间，避开学生回答、课堂噪音。每段 10~30 秒为佳。
-  2. **筛选质量好的片段**：优先选老师单独讲、语速适中、无背景噪音的片段。目标 30~60 段，总时长 10~30 分钟。
-  3. **人工校对**：听一遍，删掉质量差的（有杂音、有回声、有其他人说话的）。
+### 11.2 输入前提
 
-### 8.2 模型选型
+B.2（`generate.py`）按句输出以下字段后，本章管线才有起点：
 
-| 方案 | 模型 | 特点 | 模型大小 |
-|------|------|------|----------|
-| 阿里 | CosyVoice 2.0-0.5B | 中文效果好，支持情感控制 | ~2GB |
-| 社区 | GPT-SoVITS | 开源，支持声音克隆 | ~1GB |
-| 社区 | Fish Speech | 质量接近云端，轻量 | ~400MB |
+- `sentences[].text` — 原文
+- `sentences[].keywords[].word / note` — 重点词和释义
+- `sentences[].narration` — 每句的独立讲解文本（需在 B.2 新增"按句生成"模式）
 
-推荐 **CosyVoice 2.0**：中文情感表达最自然，适合语文课朗读。
+### 11.3 核心管线
 
-### 8.3 训练/适配
-
-- CosyVoice 2.0 的声音克隆不需要"训练"，只需提供 30~60 段参考音频，即可实时克隆。
-- 调用方式：Python SDK，输入文本 + 参考音频，输出音频文件。
-
-### 8.4 情感控制（语文课的关键）
-
-- 语文课朗读情感要求高，需要在合成时控制情感。
-- CosyVoice 2.0 支持情感标签：`happy`、`sad`、`angry`、`neutral` 等。
-- 可以让文本生成模块在输出中加情感标记，TTS 模块读取标记调整合成情感。
-
-### 8.5 和文本生成的集成
+一条管线，三种输出（网页、PPT、MP4），共用同一份时间轴 JSON。
 
 ```
-文本生成输出:
-{"text": "同学们注意啊，这个'蹒跚'两个字...", "emotion": "warm"}
-
-TTS 调用:
-CosyVoice.synthesize(text="同学们注意啊...", emotion="warm", ref_audio="teacher_ref.wav")
-
-输出: 音频文件（wav/mp3）
+B.2 按句输出 sentences[].narration
+    ↓
+build_timeline.py（按句生成 + TTS + 对齐）
+    ↓
+timeline.json（含 narration / audio / duration / keyword_timings）
+    ↓
+渲染层（三选一或多选）
+    ├── HTML 页面
+    ├── PPT（python-pptx）
+    └── MP4 视频（PIL + ffmpeg）
 ```
-
-### 8.6 建议节奏
-- 建议在文本方案稳定后再做，不要一开始耦合。
-- 先用 edge-tts（微软云端）做原型验证，确认效果后再换本地模型。
 
 ---
 
-## 9. 合规与风险（必须提前确认）
+#### 11.3.1 步骤 1：按句生成讲解
 
-- **肖像/声音/教学内容授权**：克隆真人风格和声音，需取得这位老师本人书面授权，尤其要商用。这是上线前的硬前置，不是技术问题但会卡住整个项目。
-- **数据安全**：转录语料含真人信息，存储和训练数据做好访问控制。
-- **幻觉风险**：语文知识讲错会误导学生，靠 RAG + 知识正确性评估兜底，必要时人工审核高频课文。
+`script/build_timeline.py` 逐句调 DeepSeek，带全文上下文 + 上一句结尾，输出到 `data/timelines/{课文名}/timeline.json`。每句拿到 `narration` 后进入下一步。
+
+#### 11.3.2 步骤 2：TTS 合成
+
+每句 `narration` 调 CosyVoice 2.0（本地离线，支持情感标签），输出 `audio/01.mp3` 等，`duration` 从 MP3 读取。
+
+> 安装和用法详见 `cosyvoice/README.md`。首次使用：
+> ```bash
+> cd ~ && git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
+> cd CosyVoice && pip3 install -r requirements.txt
+> export COSYVOICE_HOME=~/CosyVoice
+> python3 cosyvoice/download_model.py --download
+> ```
+
+#### 11.3.3 步骤 3：关键词时间戳（WhisperX 强制对齐）
+
+TTS 只出音，词级时间戳交给 WhisperX 做强制对齐，不依赖 TTS 引擎的回调。
+
+```
+CosyVoice 2.0 mp3 + narration 文本 → WhisperX 强制对齐 → 字/词级 {time, start}
+```
+
+**依赖安装**：
+
+```bash
+pip3 install whisperx
+# 首次运行自动下载 wav2vec2 中文对齐模型到 ~/.cache/
+```
+
+**代码**（`build_timeline.py` 内联或独立工具函数）：
+
+```python
+import whisperx
+
+def align_keyword_timings(audio_path: str, narration: str, keywords: list,
+                          device: str = "cpu") -> list:
+    model_a, meta = whisperx.load_align_model(language_code="zh", device=device)
+    audio = whisperx.load_audio(audio_path)
+    segments = [{"text": narration, "start": 0.0, "end": None}]
+    result = whisperx.align(segments, model_a, meta, audio, device,
+                            return_char_alignments=True)
+
+    char_times = []
+    for seg in result["segments"]:
+        for ch in seg.get("chars", []):
+            if ch.get("start") is not None:
+                char_times.append((ch["char"], ch["start"]))
+
+    full = "".join(c for c, _ in char_times)
+    timings = []
+    for kw in keywords:
+        idx = full.find(kw["word"])
+        if idx < 0:
+            continue
+        t = char_times[idx][1]
+        timings.append({
+            "word": kw["word"], "note": kw["note"],
+            "time": round(t, 2),
+            "start": round(max(0, t - 0.5), 2),
+        })
+    return sorted(timings, key=lambda x: x["time"])
+```
+
+> edge-tts 的 `WordBoundary` 对中文不可用（服务端只回 `SentenceBoundary`），无法用作时间戳来源。
+
+#### 11.3.4 产出：timeline.json
+
+```json
+{
+  "title": "《诫子书》精讲",
+  "sentences": [
+    {
+      "id": 1,
+      "text": "非淡泊无以明志，非宁静无以致远。",
+      "keywords": [
+        {"word": "淡泊", "note": "恬淡寡欲，不追求名利"}
+      ],
+      "narration": "好，我们来看第一句…",
+      "audio": "audio/01.mp3",
+      "duration": 15.5,
+      "keyword_timings": [
+        {"word": "淡泊", "note": "恬淡寡欲，不追求名利", "time": 3.9, "start": 3.4}
+      ]
+    }
+  ]
+}
+```
+
+- 句级高亮天然对齐：第 N 段只讲第 N 句，播放第 N 段时高亮第 N 句。
+- 词级高亮用 `keyword_timings`：播放时监听 `currentTime >= kw.start`。
 
 ---
 
-## 10. 一句话结论
+### 11.4 三种渲染输出
 
-> 不要纠结"蒸馏 vs 提示词"。**先把 1000 节课清洗成结构化可检索语料（阶段 A），用 RAG + 风格 Prompt 上线拿基线（阶段 B）；评估风格保真度，不够再用同一批语料做 LoRA 微调（阶段 C）。RAG 管"说什么"，微调管"怎么说"。声音是独立的 TTS 线，最后做。**
+#### 11.4.1 HTML 页面
 
-落地顺序：A（数据） → B（RAG+Prompt+评估集） → 看评估 → C（LoRA） → 7（工程化） →（可选）8（TTS）。
+一个 HTML 文件，加载 `timeline.json`，CSS + JS 驱动高亮。
+
+```html
+<style>
+  .sentence.active { background: #fff3cd; }
+  .word.active    { color: red; font-weight: bold; }
+</style>
+<div id="text"><!-- sentences 渲染 --></div>
+<div id="narration"><!-- 当前讲解 --></div>
+<script>
+  // timeupdate → 更新 .sentence.active / .word.active / 释义气泡
+</script>
+```
+
+浏览器直开，不需要编译，适合快速验证和在线课程。
+
+#### 11.4.2 PPT
+
+`python-pptx` 逐句生成幻灯片，原文区 + 讲解区 + 关键词标注。
+
+```python
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RgbColor
+
+prs = Presentation()
+prs.slide_width = Inches(13.333)
+prs.slide_height = Inches(7.5)
+
+for s in timeline["sentences"]:
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    # 原文区（拆成普通/高亮 run）
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5),
+                                   Inches(12.333), Inches(4))
+    p = tb.text_frame.paragraphs[0]
+    for seg_text, is_hl in split_highlighted(s["text"], s["keywords"]):
+        run = p.add_run()
+        run.text = seg_text
+        run.font.size = Pt(24)
+        if is_hl:
+            run.font.bold = True
+            run.font.color.rgb = RgbColor(255, 100, 0)
+
+    # 讲解区
+    nb = slide.shapes.add_textbox(Inches(0.5), Inches(4.8),
+                                   Inches(12.333), Inches(2.2))
+    nb.text_frame.paragraphs[0].text = s["narration"]
+
+prs.save("lecture.pptx")
+```
+
+> python-pptx 需指定中文字体（`run.font.name = "PingFang SC"` 等）。`run` 只能整段设样式，不能逐字高亮——所以要先把原文拆成普通段和高亮段再分别添加 `run`。
+
+PPT 转视频：有 Office 用 `powerpnt /video` 命令行导出；无 Office 回退到 11.4.3 图片+ffmpeg 方案。
+
+#### 11.4.3 MP4 视频
+
+每句一段短视频：PIL 渲染带高亮的静态图 → ffmpeg 合成图片 + 音频。
+
+```bash
+ffmpeg -loop 1 -i frame_01.jpg -i audio/01.mp3 \
+  -c:v h264 -tune stillimage -c:a aac -b:a 192k -shortest out_01.mp4
+```
+
+- 需要逐词动效时，按 `keyword_timings` 把一句切多张帧图（每个关键词时间点换一张），再用 ffmpeg 按时间拼接。
+- 多段拼接用 `ffmpeg concat`，各段编码参数（分辨率/帧率/采样率）必须一致。
+
+**三种输出适用场景**：
+
+| 输出 | 适合 |
+|---|---|
+| HTML | 快速验证、在线课程 |
+| PPT | 教师二次编辑、课堂放映 |
+| MP4 | 完整视频课、对外发布 |
+
+---
+
+### 11.5 落地顺序
+
+#### 11.5.1 `build_timeline.py` — 讲解时间轴生成
+
+所有渲染输出的核心入口。输入课文查询，输出 `timeline.json` + 音频文件。
+
+**执行流程**：
+
+```
+DeepSeek 逐句生成 narration
+  → CosyVoice 2.0 合成 mp3（audio/01.mp3 …）
+  → mutagen 读时长 → 写入 duration
+  → WhisperX 强制对齐 → 写入 keyword_timings
+  → 输出 data/timelines/{课文名}/timeline.json
+```
+
+**用法**：
+
+```bash
+# 全量跑
+python3 script/build_timeline.py "诫子书 全文"
+
+# 调试：只跑前 3 句，打印讲解内容
+python3 script/build_timeline.py "诫子书" --max-sentences 3 --verbose
+
+# 只生成讲解文本，不合成音频（先看稿子质量）
+python3 script/build_timeline.py "诫子书" --skip-tts
+
+# 跳过对齐（不生成 keyword_timings）
+python3 script/build_timeline.py "诫子书" --skip-align
+```
+
+**JSON 缓存**：timeline.json 已存在时自动加载，跳过 DeepSeek 生成，直接跑 TTS + 对齐。要重新生成需先删文件。
+
+**输入依赖**：
+
+- 复用 `script/generate.py` 的意图解析、课文事实获取、语料检索、风格加载
+- 逐句调 DeepSeek API 生成 `narration`（带全文上下文 + 上一句结尾过渡）
+- `cosyvoice/synthesize.py` 提供 TTS 合成
+- `whisperx` 提供强制对齐
+
+**输出**：`data/timelines/{课文名}/` 目录下 `timeline.json` + `audio/*.mp3`。
+
+#### 11.5.2 HTML 播放器
+
+### 11.6 依赖关系
+
+- **B.2 `generate.py`**：提供 sentences（text/keywords/narration）
+- **`cosyvoice/`**：本地 TTS（CosyVoice 2.0）
+- **`whisperx`**：强制对齐拿词级时间戳
+- **DeepSeek API**：生成 narration
+- **PIL / python-pptx / ffmpeg**：渲染层（按输出格式选用）
+
+### 11.7 部署环境要求
+
+#### 11.7.1 系统要求
+
+| 项目 | 最低 | 建议 |
+|---|---|---|
+| **Python** | 3.10+（CosyVoice 硬性要求） | 3.11 |
+| **系统包** | `ffmpeg`（视频合成） | |
+| **内存** | 8GB | 16GB+（Align 模型加载峰值约 4GB） |
+| **磁盘** | 20GB | 50GB+（含模型 ~5GB、输出音频/视频） |
+| **GPU** | 不需要（纯 CPU） | NVIDIA 显卡可加速 TTS，非必须 |
+
+#### 11.7.2 Python 环境
+
+```bash
+# 创建虚拟环境（必须 Python 3.10+）
+python3.11 -m venv venv
+source venv/bin/activate
+
+# 项目依赖
+pip install -r requirements.txt
+```
+
+#### 11.7.3 CosyVoice（从源码安装）
+
+```bash
+cd ~
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
+cd CosyVoice
+pip install -r requirements.txt
+pip install third_party/Matcha-TTS/
+
+# 下载模型到项目内
+# （在 teachergpt 目录下执行）
+python cosyvoice/download_model.py --download
+
+export COSYVOICE_HOME=~/CosyVoice
+```
+
+#### 11.7.4 模型文件
+
+首次运行会自动下载，或手动预下载：
+
+| 模型 | 位置 | 大小 | 下载方式 |
+|---|---|---|---|
+| CosyVoice2-0.5B | `cosyvoice/models/` | ~2GB | `python cosyvoice/download_model.py --download` |
+| BGE Embedding | `bge/models/` | ~1.3GB | `python bge/download_model.py --download` |
+| WhisperX Align | `~/.cache/` | ~1.5GB | 首次运行 WhisperX 自动下载 |
+
+#### 11.7.5 外部服务
+
+- **DeepSeek API**：需要 `api_key`（腾讯云内网可直连），配置文件见 `script/generate.py` 的 `load_config()`
+- 其余全部本地运行，无需外部服务
+
+#### 11.7.6 部署清单
+
+```bash
+# 1. 系统
+brew install ffmpeg        # macOS
+apt install ffmpeg         # Ubuntu
+
+# 2. Python 3.10+
+python3.11 -m venv venv && source venv/bin/activate
+
+# 3. 项目 + CosyVoice
+pip install -r requirements.txt
+# CosyVoice 按 11.7.3 从源码安装
+
+# 4. 模型下载
+python bge/download_model.py --download
+python cosyvoice/download_model.py --download
+
+# 5. 验证
+export COSYVOICE_HOME=~/CosyVoice
+python script/build_timeline.py "诫子书 全文" --skip-tts
+```

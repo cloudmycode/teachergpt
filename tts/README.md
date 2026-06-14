@@ -13,7 +13,7 @@ tts/
 ## 依赖
 
 ```bash
-pip install edge-tts
+pip3 install edge-tts
 ```
 
 ## 用法
@@ -42,12 +42,12 @@ python3.13 synthesize.py path/to/text.txt --name my_clip
 
 ```bash
 # 完整链路：音频 → 文本 → 翻译 → 音频
-python3.13 ../asr/transcribe.py some.mp3 --json
+python3 ../asr/transcribe.py some.mp3 --json
 # → some.txt（带时间戳）
 
 # ... 自己翻译成中文得到 some.zh.txt ...
 
-python3.13 synthesize.py some.zh.txt
+python3 synthesize.py some.zh.txt
 # → output/some.zh.mp3
 ```
 

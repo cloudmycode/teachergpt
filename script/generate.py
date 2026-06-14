@@ -127,7 +127,10 @@ def parse_intent(query: str, cfg: "dict | None" = None) -> dict:
             parsed = json.loads(content)
             lesson = parsed.get("lesson", "") or lesson
             scope = parsed.get("scope", "") or scope
-            intent = parsed.get("intent", "") or intent
+            model_intent = parsed.get("intent", "")
+            # 只接受已知意图，防止模型返回自由文本
+            VALID_INTENTS = {"精读讲解", "字词分析", "背景导入", "概括大意"}
+            intent = model_intent if model_intent in VALID_INTENTS else intent
         except Exception:
             pass
 
@@ -184,7 +187,7 @@ def _extract_lesson(q: str) -> str:
     if m:
         return m.group(1)
     # 已知课程名
-    courses = ["世说新语", "背影", "滕王阁序"]
+    courses = ["世说新语", "背影", "滕王阁序", "诫子书", "爱莲说", "陋室铭", "桃花源记", "岳阳楼记", "醉翁亭记"]
     for c in courses:
         if c in q:
             return c
