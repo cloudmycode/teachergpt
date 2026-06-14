@@ -3,7 +3,7 @@
 """
 管理 faster-whisper 模型：检查更新、下载、覆盖。
 
-默认目标：../models/faster-whisper-medium/（相对脚本位置）。
+默认目标：../models/faster-whisper-small/（相对脚本位置）。
 支持任意 Systran/faster-whisper-* 模型。
 
 用法:
@@ -34,9 +34,9 @@ import shutil
 import sys
 from pathlib import Path
 
-DEFAULT_REPO = "Systran/faster-whisper-medium"
+DEFAULT_REPO = "Systran/faster-whisper-small"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_TARGET = SCRIPT_DIR / "models" / "faster-whisper-medium"
+DEFAULT_TARGET = SCRIPT_DIR / "models" / "faster-whisper-small"
 REVISION_FILE = ".revision"  # 记录本地上次拉取的远端 commit sha
 
 

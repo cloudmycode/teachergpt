@@ -63,6 +63,8 @@ def main() -> None:
         ids = res["ids"][0]
 
         # 精排
+        import os
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from sentence_transformers import CrossEncoder
         reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", cache_folder=args.model_dir)
         pairs = [[args.query, doc] for doc in docs]

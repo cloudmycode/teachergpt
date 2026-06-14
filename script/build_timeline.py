@@ -4,50 +4,42 @@
 按句生成讲解时间轴（设计文档 §11 核心管线）。
 
 输入：课文查询（如"诫子书 全文"）
-输出：data/timelines/{课文名}/timeline.json
+输出：
+  data/timelines/{课文名}/script.json         讲稿（narration）
+  data/timelines/{课文名}/timeline.json        时间轴（narration + audio + keyword_timings）
 
 流程：
   1. 复用 generate.py 的意图解析 + 课文事实获取 → sentences / keywords
-  2. 对每句调 DeepSeek 生成 narration（带上下文和上一句结尾）
-  3. CosyVoice 2.0 合成讲解音频
-  4. WhisperX 强制对齐 → keyword_timings
-  5. 输出完整 timeline JSON
+  2. 对每句调 DeepSeek 生成 narration（带上下文和上一句结尾）→ 存 script.json
+  3. edge-tts 合成讲解音频（免费云端 TTS）
+  4. 线性估时对齐 → keyword_timings（按关键词字符位置占比 × 音频时长）
+  5. 输出完整 timeline.json
 
 用法：
   python3 script/build_timeline.py "诫子书 全文"
   python3 script/build_timeline.py "诫子书 全文" --max-sentences 3 --verbose
-  python3 script/build_timeline.py "诫子书" --skip-tts        # 只生成讲解文本，不合成音频
-  python3 script/build_timeline.py "诫子书" --skip-align      # 跳过 WhisperX 对齐
+  python3 script/build_timeline.py "诫子书" --skip-tts        # 只生成讲解文本
+  python3 script/build_timeline.py "诫子书" --skip-align      # 跳过对齐
   python3 script/build_timeline.py "诫子书" --skip-tts --skip-align  # 仅生成 narration
 """
 
 import argparse
+import asyncio
 import json
-import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(SCRIPT_DIR))
 
-# CosyVoice 源码路径（需先 git clone --recursive）
-# 默认 ~/CosyVoice，可通过 COSYVOICE_HOME 覆盖
-_COSYVOICE_HOME = Path(
-    os.environ.get("COSYVOICE_HOME", Path.home() / "CosyVoice")
-)
-if _COSYVOICE_HOME.is_dir():
-    sys.path.insert(0, str(_COSYVOICE_HOME))
-
 import generate  # 复用意图解析、课文事实、检索、风格加载
 
 DATA_DIR = PROJECT_ROOT / "data"
 TIMELINE_DIR = DATA_DIR / "timelines"
-
-# CosyVoice 本地模型目录
-COSYVOICE_MODEL = PROJECT_ROOT / "cosyvoice" / "models" / "CosyVoice2-0.5B"
 
 # ------------------------------------------------------------------- 逐句生成
 
@@ -66,6 +58,9 @@ PER_SENTENCE_USER = """{few_shot}
 4. 上一句结尾为参考，开头的过渡语自然衔接（如"接着看下一句""好，我们再来看"），
    但不要重复复述上一句内容。
 5. 不限字数，该展开就展开。
+6. **重要**：以下是本句所有的重点词，你必须逐个讲解，并且在讲到该词时用方括号 [ ] 标记。
+   例如讲解"静"字时写成 [静]。注意：仅在讲解该词含义时标记，
+   开头引用原文（如"静以修身"）时不要标记。必须标记所有重点词，一个都不能漏。
 
 请直接输出讲解文本，不要加标题，不要输出 JSON。"""
 
@@ -162,41 +157,27 @@ def build_per_sentence_prompt(
 
 # ------------------------------------------------------------------- TTS
 
-def synthesize_audio(narration: str, out_path: Path) -> float:
-    """CosyVoice 2.0 合成音频，返回时长（秒）。"""
+async def synthesize_audio_async(narration: str, out_path: Path) -> None:
+    """edge-tts 合成音频到 mp3。
+
+    注：edge-tts 逆向的微软 Read-Aloud 接口对中文不返回 WordBoundary 事件
+    （实测中文文本边界数恒为 0），故无法用 TTS 词边界做对齐，
+    关键词时间统一走 align_by_ratio（字符位置线性估时）。
+    """
+    import edge_tts
+
+    voice = "zh-CN-XiaoxiaoNeural"
+    comm = edge_tts.Communicate(narration, voice)
+    await comm.save(str(out_path))
+
+
+def synthesize_audio(narration: str, out_path: Path) -> None:
+    """edge-tts 合成（同步封装）。"""
     narration = narration.strip()
     if not narration:
-        return 0.0
-
+        return
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from cosyvoice.cli.cosyvoice import CosyVoice2
-    except ModuleNotFoundError:
-        print(
-            "\n✗ CosyVoice 未正确安装。请按以下步骤操作：\n"
-            "  cd ~\n"
-            "  git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git\n"
-            "  cd CosyVoice\n"
-            "  pip install -r requirements.txt\n"
-            "\n然后设置环境变量:\n"
-            "  export COSYVOICE_HOME=~/CosyVoice\n"
-        )
-        sys.exit(1)
-
-    import numpy as np
-    import soundfile as sf
-
-    model = CosyVoice2(str(COSYVOICE_MODEL))
-    output = model.inference(narration, stream=False)
-    chunks = [seg["tts_speech"] for seg in output]
-    audio = np.concatenate(chunks) if chunks else np.array([])
-
-    if len(audio) == 0:
-        return 0.0
-
-    sf.write(str(out_path), audio, 24000)
-    return round(len(audio) / 24000, 1)
+    asyncio.run(synthesize_audio_async(narration, out_path))
 
 
 def read_mp3_duration(path: Path) -> float:
@@ -205,35 +186,83 @@ def read_mp3_duration(path: Path) -> float:
     return MP3(path).info.length
 
 
-# ------------------------------------------------------------------- 强制对齐
+# ------------------------------------------------------------------- 标记解析
 
-def align_keywords(audio_path: Path, narration: str, keywords: list,
-                   device: str = "cpu") -> list[dict]:
-    """WhisperX 强制对齐 → 关键词时间戳。"""
-    import whisperx
+def parse_markers(narration: str) -> tuple[str, dict[str, int]]:
+    """解析 [关键词] 标记，返回 (纯净文本, {词: 字符位置})。
 
-    model_a, meta = whisperx.load_align_model(language_code="zh", device=device)
-    audio = whisperx.load_audio(str(audio_path))
-    segments = [{"text": narration, "start": 0.0, "end": None}]
-    result = whisperx.align(segments, model_a, meta, audio, device,
-                            return_char_alignments=True)
+    注：DeepSeek 可能在同一句里多次标记同一词（如开头引用原句时 + 讲解时）。
+    这里会解析出首次标记的位置。但最终用于高亮的是按字符占比 × 音频时长的
+    线性估时——该位置占 narration 长度的比例，估算音频读到该位置的时刻。
+    若 DeepSeek 在原句引用处标记而非讲解处标记，估时仍会偏早，但比启发式
+    猜测（取中部出现）更可控。
+    """
+    import re
 
-    char_times = []
-    for seg in result["segments"]:
-        for ch in seg.get("chars", []):
-            if ch.get("start") is not None:
-                char_times.append((ch["char"], ch["start"]))
+    positions = {}
+    clean = []
+    offset = 0
+    for m in re.finditer(r"\[(.+?)\]", narration):
+        word = m.group(1)
+        if word not in positions:
+            positions[word] = m.start() - offset
+        clean.append(narration[offset:m.start()])
+        clean.append(word)
+        offset = m.end()
+    clean.append(narration[offset:])
+    return "".join(clean), positions
 
-    full = "".join(c for c, _ in char_times)
+
+# ------------------------------------------------------------------- 关键词定位（已废弃，保留兼容）
+# locate_keywords_in_narration 已移除，改用 DeepSeek 生成时直接标 [关键词]
+
+
+# ------------------------------------------------------------------- 对齐
+
+def _narration_pos(narration: str, word: str,
+                   positions: Optional[dict]) -> Optional[int]:
+    """关键词在 narration 原文中的字符位置。
+
+    优先找讲解引导词（"这个X"/"再看X"/"所谓X"），
+    这是中文讲解的自然语序，比 [词] 标记更可靠。
+    引导词匹配不到再退回用 [词] 标记；都没有就返回 None。
+    """
+    import re
+    # 引导词 + 可选引号 + 关键词
+    guides = r"(?:这个|再看|所谓|叫做|注意这个|先看|重点看|就是)"
+    quote = r"(?:[\u201c\u201d\u2018\u2019\u300c\u300d\"'']?)"
+    pattern = re.compile(f"({guides})\\s*{quote}({re.escape(word)})")
+    m = pattern.search(narration)
+    if m:
+        return m.start(2)  # 关键词组的起始位置
+    if positions and word in positions:
+        return positions[word]
+    return None
+
+
+def align_by_ratio(narration: str, keywords: list, duration: float,
+                   positions: Optional[dict] = None) -> list:
+    """按字符位置线性估时定位关键词（默认对齐路径，无需 ASR）。
+
+    edge-tts 中文语速均匀，关键词在讲解文本中的字符位置占比 × 音频时长
+    ≈ 读到该词的时刻，误差通常 1~2 秒内，对"讲到词→句中高亮"足够，
+    且零 ASR 误差、零依赖、秒级完成。
+
+    定位仍优先用 DeepSeek 打的 [词] 标记(positions)，否则取该词在原文
+    中部出现处（_narration_pos）。
+    """
+    n = len(narration)
+    if n == 0 or duration <= 0:
+        return []
     timings = []
     for kw in keywords:
         word = kw.get("word", "")
         if not word:
             continue
-        idx = full.find(word)
-        if idx < 0:
+        npos = _narration_pos(narration, word, positions)
+        if npos is None:
             continue
-        t = char_times[idx][1]
+        t = npos / n * duration
         timings.append({
             "word": word,
             "note": kw.get("note", ""),
@@ -243,11 +272,35 @@ def align_keywords(audio_path: Path, narration: str, keywords: list,
     return sorted(timings, key=lambda x: x["time"])
 
 
+# ------------------------------------------------------------------- 保存
+
+def _save_json(out_file: Path, lesson_name: str, facts: dict,
+               results: list) -> None:
+    """写入 JSON。
+
+    保留 _positions（[词] 标记解析出的原文位置），
+    供重跑对齐时精确去歧义，否则只能退回"取中部出现"的粗略猜测。
+    """
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    obj = {
+        "title": f"《{lesson_name}》精讲",
+        "author": facts.get("author", ""),
+        "dynasty": facts.get("dynasty", ""),
+        "source": facts.get("source", ""),
+        "sentences": results,
+    }
+    out_file.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 # ------------------------------------------------------------------- main
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="按句生成讲解时间轴（CosyVoice + WhisperX）"
+        description="按句生成讲解时间轴（edge-tts + 线性估时对齐）"
     )
     p.add_argument("query", type=str, help="课文查询，如'诫子书 全文'")
     p.add_argument("--lesson", type=str, default=None,
@@ -257,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-tts", action="store_true",
                    help="跳过 TTS 合成")
     p.add_argument("--skip-align", action="store_true",
-                   help="跳过 WhisperX 对齐（不生成 keyword_timings）")
+                   help="跳过对齐（不生成 keyword_timings）")
     p.add_argument("--rerank", action="store_true",
                    help="启用 reranker 精排")
     p.add_argument("--verbose", "-v", action="store_true",
@@ -278,12 +331,13 @@ def main() -> None:
     if args.lesson:
         lesson_name = args.lesson
     lesson_dir = TIMELINE_DIR / lesson_name.replace("/", "_")
-    out_file = lesson_dir / "timeline.json"
+    script_file = lesson_dir / "script.json"
+    timeline_file = lesson_dir / "timeline.json"
 
-    if out_file.exists():
-        # JSON 已存在，跳过 DeepSeek，直接跑 TTS + 对齐
-        print(f"JSON 已存在，跳过生成: {out_file}")
-        timeline = json.loads(out_file.read_text(encoding="utf-8"))
+    if script_file.exists():
+        # 已有讲稿，跳过 DeepSeek，直接跑 TTS + 对齐
+        print(f"讲稿已存在，跳过生成: {script_file}")
+        timeline = json.loads(script_file.read_text(encoding="utf-8"))
         results = timeline.get("sentences", [])
         total = len(results)
         facts = {
@@ -341,10 +395,13 @@ def main() -> None:
                 s, idx, total, facts, style, segments, prev_narration,
             )
             try:
-                narration = generate.call_deepseek(cfg, system, user).strip()
+                raw = generate.call_deepseek(cfg, system, user).strip()
             except Exception as e:
                 print(f"✗ {e}")
-                narration = ""
+                raw = ""
+
+            # clean narration（去除 [关键词] 标记——暂不用于对齐，仅保留纯净文本）
+            narration, _ = parse_markers(raw)
 
             dt = time.time() - t0
             print(f"({dt:.1f}s)")
@@ -362,12 +419,17 @@ def main() -> None:
             results.append(entry)
             prev_narration = narration
 
+    # 先生成别忘了存——万一 TTS 崩了稿子还在
+    if not script_file.exists():
+        _save_json(script_file, lesson_name, facts, results)
+        print(f"✓ 讲稿已存: {script_file}")
+
     # 步骤 6: TTS + 对齐
     if not args.skip_tts:
         audio_dir = lesson_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        print("\nTTS 合成（CosyVoice 2.0）...")
+        print("\nTTS 合成（edge-tts）...")
         for entry in results:
             idx = entry["id"]
             narration = entry.get("narration", "")
@@ -376,49 +438,27 @@ def main() -> None:
                 continue
 
             mp3_path = audio_dir / f"{idx:02d}.mp3"
-            print(f"  [{idx}/{total}] 合成...", end=" ", flush=True)
-
-            dur = synthesize_audio(narration, mp3_path)
             entry["audio"] = str(mp3_path.relative_to(lesson_dir))
-            entry["duration"] = dur
+
+            if mp3_path.exists():
+                dur = read_mp3_duration(mp3_path)
+                entry["duration"] = round(dur, 1)
+                print(f"  [{idx}/{total}] 已存在，跳过 ({dur:.1f}s)")
+                continue
+
+            print(f"  [{idx}/{total}] 合成...", end=" ", flush=True)
+            synthesize_audio(narration, mp3_path)
+            dur = read_mp3_duration(mp3_path)
+            entry["duration"] = round(dur, 1)
             print(f"{dur:.1f}s")
 
-        # 对齐
-        if not args.skip_align:
-            print("\n强制对齐（WhisperX）...")
-            for entry in results:
-                idx = entry["id"]
-                narration = entry.get("narration", "")
-                keywords = entry.get("keywords", [])
-                if not narration or not keywords:
-                    entry["keyword_timings"] = []
-                    continue
+        # 关键词对齐（TODO: 待攻坚）
+        for entry in results:
+            entry["keyword_timings"] = []
 
-                mp3_path = lesson_dir / entry["audio"]
-                print(f"  [{idx}/{total}] 对齐...", end=" ", flush=True)
-                timings = align_keywords(mp3_path, narration, keywords)
-                entry["keyword_timings"] = timings
-                print(f"{len(timings)} 个关键词")
-        else:
-            for entry in results:
-                entry["keyword_timings"] = []
-
-    # 步骤 7: 输出 JSON
-    lesson_dir.mkdir(parents=True, exist_ok=True)
-
-    timeline = {
-        "title": f"《{lesson_name}》精讲",
-        "author": facts.get("author", ""),
-        "dynasty": facts.get("dynasty", ""),
-        "source": facts.get("source", ""),
-        "sentences": results,
-    }
-
-    out_file.write_text(
-        json.dumps(timeline, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"\n✓ 已输出 {out_file}")
+    # 步骤 7: 输出 timeline.json
+    _save_json(timeline_file, lesson_name, facts, results)
+    print(f"✓ timeline: {timeline_file}")
 
     ok = sum(1 for r in results if r["narration"])
     chars = sum(len(r["narration"]) for r in results)

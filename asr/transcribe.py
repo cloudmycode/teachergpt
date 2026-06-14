@@ -14,7 +14,7 @@
   <stem>.json    段级 + 词级时间戳（仅 --json 时生成）
 
 环境变量:
-  WHISPER_MODEL  模型路径或 HF 模型名，默认 ../models/faster-whisper-medium
+  WHISPER_MODEL  模型路径或 HF 模型名，默认 ./models/faster-whisper-small
 """
 
 import argparse
@@ -27,7 +27,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = os.environ.get(
     "WHISPER_MODEL",
-    str(SCRIPT_DIR / "models" / "faster-whisper-medium"),
+    str(SCRIPT_DIR / "models" / "faster-whisper-small"),
 )
 DEFAULT_OUT = SCRIPT_DIR / "output"
 

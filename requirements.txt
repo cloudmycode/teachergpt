@@ -16,10 +16,7 @@ sentence-transformers>=3.0
 huggingface-hub>=0.20
 
 # TTS：讲解音频合成 (tts/, script/build_timeline.py)
-# CosyVoice 2.0 需从源码安装（PyPI 包不可用），见 cosyvoice/README.md：
-#   cd ~ && git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
-#   cd CosyVoice && pip3 install -r requirements.txt
-#   export COSYVOICE_HOME=~/CosyVoice
+edge-tts>=6.1
 
-# 强制对齐：字/词级时间戳 (script/build_timeline.py)
-whisperx>=3.1
+# 音频时长读取 (script/build_timeline.py)
+mutagen>=1.46

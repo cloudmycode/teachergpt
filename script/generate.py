@@ -249,6 +249,8 @@ def retrieve(
     ids = res["ids"][0]
 
     if rerank and len(docs) > top:
+        import os
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from sentence_transformers import CrossEncoder
         reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
         pairs = [[query, d] for d in docs]

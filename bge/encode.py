@@ -24,6 +24,8 @@ class Encoder:
     """BGE 编码器，加载一次即可反复使用。"""
 
     def __init__(self, model_dir: Optional[str] = None):
+        import os
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")  # 本地已有模型，禁止联网检查
         from sentence_transformers import SentenceTransformer
         self._model = SentenceTransformer(
             "BAAI/bge-large-zh-v1.5",
