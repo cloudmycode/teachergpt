@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>精讲课 - 中学古文</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+  }
+  h1 {
+    font-size: 32px;
+    margin-bottom: 40px;
+    color: #fff;
+  }
+  .input-wrapper {
+    width: 100%;
+    max-width: 400px;
+  }
+  .input-wrapper input {
+    width: 100%;
+    padding: 16px 20px;
+    border: none;
+    border-radius: 12px;
+    font-size: 16px;
+    text-align: center;
+    background: #fff;
+    color: #333;
+    transition: box-shadow 0.2s;
+  }
+  .input-wrapper input:focus {
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(255,255,255,0.2);
+  }
+  .input-wrapper input::placeholder {
+    color: #999;
+  }
+  button.submit {
+    margin-top: 24px;
+    width: 100%;
+    padding: 14px;
+    background: #4facfe;
+    color: #fff;
+    border: none;
+    border-radius: 12px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+  }
+  button.submit:hover { background: #3a9bd4; }
+  button.submit:active { transform: translateY(1px); }
+  button.submit:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .status {
+    margin-top: 30px;
+    text-align: center;
+    font-size: 14px;
+    color: #aaa;
+    min-height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .status.running { color: #f0ad4e; }
+  .status.success { color: #5cb85c; }
+  .status.error { color: #d9534f; }
+  .download-btn {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 10px 24px;
+    background: #5cb85c;
+    color: #fff;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .download-btn:hover { background: #4cae4c; }
+  .loading {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top: 2px solid #f0ad4e;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+  @keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+</style>
+</head>
+<body>
+  <h1>精讲课 - 中学古文</h1>
+
+  <form id="generateForm" class="input-wrapper">
+    <input type="text" id="lesson" name="lesson" placeholder="如：木兰词" required>
+    <button type="submit" class="submit" id="submitBtn">生成 PPT</button>
+  </form>
+
+  <div class="status" id="statusBox">
+    <span id="statusText"></span>
+    <a id="downloadLink" class="download-btn" style="display:none;">下载 PPT</a>
+  </div>
+
+<script>
+  const form = document.getElementById('generateForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const statusBox = document.getElementById('statusBox');
+  const statusText = document.getElementById('statusText');
+  const downloadLink = document.getElementById('downloadLink');
+
+  let currentTaskId = null;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const lesson = document.getElementById('lesson').value.trim();
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = '生成中...';
+    statusBox.className = 'status running';
+    statusText.innerHTML = '<span class="loading"></span>正在获取《' + lesson + '》原文...';
+
+    try {
+      const resp = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lesson })
+      });
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        throw new Error(data.detail || '提交失败');
+      }
+
+      currentTaskId = data.task_id;
+      pollTask(currentTaskId, lesson);
+
+    } catch (err) {
+      showError(err.message);
+      submitBtn.disabled = false;
+      submitBtn.textContent = '生成 PPT';
+    }
+  });
+
+  function pollTask(taskId, lesson) {
+    const interval = setInterval(async () => {
+      try {
+        const resp = await fetch(`/api/task/${taskId}`);
+        const data = await resp.json();
+
+        if (data.status === 'running') {
+          showRunning(data.message);
+        } else if (data.status === 'success') {
+          clearInterval(interval);
+          showSuccess(data.message, data.pptx_path, taskId);
+        } else if (data.status === 'error') {
+          clearInterval(interval);
+          showError(data.message);
+          submitBtn.disabled = false;
+          submitBtn.textContent = '生成 PPT';
+        }
+      } catch (err) {
+        showError('查询状态失败');
+        clearInterval(interval);
+        submitBtn.disabled = false;
+        submitBtn.textContent = '生成 PPT';
+      }
+    }, 2000);
+  }
+
+  function showRunning(msg) {
+    statusBox.className = 'status running';
+    statusText.innerHTML = '<span class="loading"></span>' + msg;
+  }
+
+  function showSuccess(msg, pptxPath, taskId) {
+    statusBox.className = 'status success';
+    statusText.textContent = '✓ ' + msg;
+    downloadLink.href = '/api/download/' + taskId;
+    downloadLink.style.display = 'inline-block';
+    submitBtn.disabled = false;
+    submitBtn.textContent = '生成 PPT';
+  }
+
+  function showError(msg) {
+    statusBox.className = 'status error';
+    statusText.textContent = '✗ ' + msg;
+  }
+</script>
+</body>
+</html>

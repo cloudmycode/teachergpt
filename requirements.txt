@@ -18,5 +18,8 @@ huggingface-hub>=0.20
 # TTS：讲解音频合成 (tts/, script/build_timeline.py)
 edge-tts>=6.1
 
+# 拼音转换：文章目录名使用拼音 (script/generate.py)
+pypinyin>=0.50
+
 # 音频时长读取 (script/build_timeline.py)
 mutagen>=1.46

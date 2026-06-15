@@ -239,7 +239,9 @@ def main():
     if args.lesson:
         lesson_name = args.lesson
 
-    lesson_dir = TIMELINE_DIR / lesson_name.replace("/", "_")
+    # 目录名使用拼音
+    lesson_dir_name = generate.lesson_name_to_pinyin(lesson_name)
+    lesson_dir = TIMELINE_DIR / lesson_dir_name
     timeline_path = lesson_dir / "timeline.json"
     if not timeline_path.exists():
         print(f"✗ timeline.json 不存在: {timeline_path}")

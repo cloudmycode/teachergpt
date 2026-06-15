@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-按句生成讲解时间轴（设计文档 §11 核心管线）。
+按段落分批生成讲解时间轴（设计文档 §11 核心管线）。
 
 输入：课文查询（如"诫子书 全文"）
 输出：
@@ -10,17 +10,23 @@
 
 流程：
   1. 复用 generate.py 的意图解析 + 课文事实获取 → sentences / keywords
-  2. 对每句调 DeepSeek 生成 narration（带上下文和上一句结尾）→ 存 script.json
-  3. edge-tts 合成讲解音频（免费云端 TTS）
-  4. 线性估时对齐 → keyword_timings（按关键词字符位置占比 × 音频时长）
-  5. 输出完整 timeline.json
+  2. 按段落分批：每批处理一个段落（多句），段落间传递上下文
+  3. 对每句调 DeepSeek 生成 narration（带上下文和上一句结尾）
+  4. edge-tts 合成讲解音频（免费云端 TTS）
+  5. 线性估时对齐 → keyword_timings
+  6. 输出完整 timeline.json
+
+段落分批策略：
+  - 空行分隔段落
+  - 空行不足时，按句数分批（默认每批最多 5 句）
+  - 段落间传递上一段最后一句的 narration 作为上下文
 
 用法：
   python3 script/build_timeline.py "诫子书 全文"
-  python3 script/build_timeline.py "诫子书 全文" --max-sentences 3 --verbose
-  python3 script/build_timeline.py "诫子书" --skip-tts        # 只生成讲解文本
-  python3 script/build_timeline.py "诫子书" --skip-align      # 跳过对齐
-  python3 script/build_timeline.py "诫子书" --skip-tts --skip-align  # 仅生成 narration
+  python3 script/build_timeline.py "木兰词 全文" --batch-size 5
+  python3 script/build_timeline.py "诫子书" --skip-tts
+  python3 script/build_timeline.py "诫子书" --skip-align
+  python3 script/build_timeline.py "诫子书" --skip-tts --skip-align
 """
 
 import argparse
@@ -166,7 +172,7 @@ async def synthesize_audio_async(narration: str, out_path: Path) -> None:
     """
     import edge_tts
 
-    voice = "zh-CN-XiaoxiaoNeural"
+    voice = "zh-CN-YunjianNeural"
     comm = edge_tts.Communicate(narration, voice)
     await comm.save(str(out_path))
 
@@ -300,13 +306,15 @@ def _save_json(out_file: Path, lesson_name: str, facts: dict,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="按句生成讲解时间轴（edge-tts + 线性估时对齐）"
+        description="按段落分批生成讲解时间轴"
     )
     p.add_argument("query", type=str, help="课文查询，如'诫子书 全文'")
     p.add_argument("--lesson", type=str, default=None,
                    help="手动指定课文名")
     p.add_argument("--max-sentences", type=int, default=0,
                    help="最多处理前 N 句（0=全量），调试用")
+    p.add_argument("--batch-size", type=int, default=5,
+                   help="每批最大句数（默认 5），控制单次 LLM 请求大小")
     p.add_argument("--skip-tts", action="store_true",
                    help="跳过 TTS 合成")
     p.add_argument("--skip-align", action="store_true",
@@ -318,6 +326,51 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def split_sentences_by_paragraph(sentences: list, batch_size: int = 5) -> list:
+    """按段落分批句子。
+
+    策略：
+    1. 如果句子带有 paragraph 标记，按段落分组
+    2. 否则按 batch_size 句一批
+
+    Args:
+        sentences: 句子列表，每句可含可选的 "paragraph" 字段
+        batch_size: 每批最大句数
+
+    Returns:
+        分批后的句子列表，每批是一个句子列表
+    """
+    # 检查是否有段落标记
+    has_paragraph = any(s.get("paragraph") is not None for s in sentences)
+
+    if has_paragraph:
+        # 按段落分组
+        paragraphs = {}
+        for s in sentences:
+            para = s.get("paragraph", 0)
+            if para not in paragraphs:
+                paragraphs[para] = []
+            paragraphs[para].append(s)
+
+        # 合并小段落，拆分大段落
+        batches = []
+        for para_idx in sorted(paragraphs.keys()):
+            para_sentences = paragraphs[para_idx]
+            if len(para_sentences) <= batch_size:
+                batches.append(para_sentences)
+            else:
+                # 大段落按 batch_size 拆分
+                for i in range(0, len(para_sentences), batch_size):
+                    batches.append(para_sentences[i:i + batch_size])
+        return batches
+    else:
+        # 没有段落标记，按 batch_size 分批
+        batches = []
+        for i in range(0, len(sentences), batch_size):
+            batches.append(sentences[i:i + batch_size])
+        return batches
+
+
 def main() -> None:
     args = parse_args()
 
@@ -326,11 +379,13 @@ def main() -> None:
         print("✗ 未找到 DeepSeek api_key。")
         sys.exit(1)
 
-    # 确定输出目录
+    # 确定输出目录（使用拼音）
     lesson_name = generate._extract_lesson(args.query)
     if args.lesson:
         lesson_name = args.lesson
-    lesson_dir = TIMELINE_DIR / lesson_name.replace("/", "_")
+    # 目录名使用拼音，服务器兼容性更好
+    lesson_dir_name = generate.lesson_name_to_pinyin(lesson_name)
+    lesson_dir = TIMELINE_DIR / lesson_dir_name
     script_file = lesson_dir / "script.json"
     timeline_file = lesson_dir / "timeline.json"
 
@@ -380,44 +435,56 @@ def main() -> None:
         # 步骤 4: 加载风格
         style = generate.load_style()
 
-        # 步骤 5: 逐句生成 narration
-        print(f"\n逐句生成讲解 ({cfg['model']})：")
+        # 步骤 5: 按段落分批生成 narration
+        batch_size = args.batch_size
+        batches = split_sentences_by_paragraph(sentences, batch_size)
+        num_batches = len(batches)
+        print(f"\n分 {num_batches} 批生成讲解（每批最多 {batch_size} 句）：")
+
         results = []
-        prev_narration = ""
+        prev_narration = ""  # 跨批传递上下文
 
-        for i, s in enumerate(sentences):
-            idx = i + 1
-            text_preview = s.get("text", "")[:30]
-            print(f"  [{idx}/{total}] {text_preview}...", end=" ", flush=True)
+        for batch_idx, batch_sentences in enumerate(batches):
+            batch_start = sum(len(b) for b in batches[:batch_idx])
+            batch_sentences_in_results = [
+                sentences[batch_start + i] for i in range(len(batch_sentences))
+            ]
 
-            t0 = time.time()
-            system, user = build_per_sentence_prompt(
-                s, idx, total, facts, style, segments, prev_narration,
-            )
-            try:
-                raw = generate.call_deepseek(cfg, system, user).strip()
-            except Exception as e:
-                print(f"✗ {e}")
-                raw = ""
+            print(f"\n--- 批次 {batch_idx + 1}/{num_batches}（{len(batch_sentences)} 句）---")
 
-            # clean narration（去除 [关键词] 标记——暂不用于对齐，仅保留纯净文本）
-            narration, _ = parse_markers(raw)
+            for i, s in enumerate(batch_sentences_in_results):
+                idx = batch_start + i + 1
+                text_preview = s.get("text", "")[:30]
+                print(f"  [{idx}/{total}] {text_preview}...", end=" ", flush=True)
 
-            dt = time.time() - t0
-            print(f"({dt:.1f}s)")
+                t0 = time.time()
+                system, user = build_per_sentence_prompt(
+                    s, idx, total, facts, style, segments, prev_narration,
+                )
+                try:
+                    raw = generate.call_deepseek(cfg, system, user).strip()
+                except Exception as e:
+                    print(f"✗ {e}")
+                    raw = ""
 
-            if args.verbose and narration:
-                print(f"    {narration[:150]}...")
+                # clean narration（去除 [关键词] 标记——暂不用于对齐，仅保留纯净文本）
+                narration, _ = parse_markers(raw)
 
-            entry = {
-                "id": idx,
-                "text": s.get("text", ""),
-                "translation": s.get("translation", ""),
-                "keywords": s.get("keywords", []),
-                "narration": narration,
-            }
-            results.append(entry)
-            prev_narration = narration
+                dt = time.time() - t0
+                print(f"({dt:.1f}s)")
+
+                if args.verbose and narration:
+                    print(f"    {narration[:150]}...")
+
+                entry = {
+                    "id": idx,
+                    "text": s.get("text", ""),
+                    "translation": s.get("translation", ""),
+                    "keywords": s.get("keywords", []),
+                    "narration": narration,
+                }
+                results.append(entry)
+                prev_narration = narration  # 更新为当前句的 narration
 
     # 先生成别忘了存——万一 TTS 崩了稿子还在
     if not script_file.exists():

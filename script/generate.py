@@ -148,6 +148,9 @@ def fetch_lesson_facts(cfg: dict, query: str, intent: dict) -> "dict | None":
 
     只在意图为讲解类（精读/字词/背景）时触发，避免无关场景浪费调用。
     返回的 facts 将注入 system prompt 作为生成时的"已知事实"，禁止模型自行编造。
+
+    返回的 sentences 中可包含可选的 "paragraph" 字段（段落索引，从 0 开始），
+    用于按段落分批生成讲解。
     """
     text_intents = {"精读讲解", "字词分析", "背景导入", "概括大意"}
     if intent.get("intent", "") not in text_intents:
@@ -162,14 +165,17 @@ def fetch_lesson_facts(cfg: dict, query: str, intent: dict) -> "dict | None":
         f"用户想了解以下课文信息：\n"
         f"课文：{lesson}\n" + (f"范围：{scope}\n" if scope else "")
         + "\n请输出 JSON，其中 sentences 要把指定范围的原文**逐句拆开**，"
-        "每句标出需要精讲的重点字词及其释义（实词/虚词/活用/古今异义/通假等优先）：\n"
+        "每句标出需要精讲的重点字词及其释义（实词/虚词/活用/古今异义/通假等优先）。"
+        "同时为每句标注 paragraph 字段（段落索引，从 0 开始），"
+        "段落按原文自然段划分（空行分隔）。\n"
         '{"author":"作者名","dynasty":"朝代","source":"出处/选自",'
         '"excerpt":"指定范围的完整课文原文（指定了范围只输出该范围；否则输出核心段落）",'
-        '"sentences":[{"text":"原文一句","translation":"该句白话翻译",'
+        '"sentences":[{"text":"原文一句","translation":"该句白话翻译","paragraph":0,'
         '"keywords":[{"word":"重点字词","note":"释义/用法"}]}],'
         '"synopsis":"课文内容概要（100字内）","keyPoints":["关键知识点1","关键知识点2"]}\n'
         "要求：sentences 按原文顺序逐句排列，不要遗漏；keywords 是该句真正的考点字词，"
-        "没有重点词的句子 keywords 可为空数组。如果某项不确定，留空字符串。只输出 JSON。"
+        "没有重点词的句子 keywords 可为空数组。paragraph 用于按段落分批生成，"
+        "没有段落信息时可不填。如果某项不确定，留空字符串。只输出 JSON。"
     )
 
     try:
@@ -178,6 +184,24 @@ def fetch_lesson_facts(cfg: dict, query: str, intent: dict) -> "dict | None":
         return json.loads(content)
     except Exception:
         return None
+
+
+def lesson_name_to_pinyin(name: str) -> str:
+    """将文章名转为拼音，用于目录名（服务器兼容性更好）。
+    
+    例：木兰词 -> mulan_ci, 诫子书 -> jiezi_shu
+    """
+    try:
+        from pypinyin import pinyin, Style
+        # 转拼音，使用 normal 风格（无声调）
+        py_list = pinyin(name, style=Style.NORMAL)
+        # 合并每个字的拼音
+        result = "_".join("".join(py) for py in py_list)
+        # 转小写，移除空格
+        return result.lower().replace(" ", "")
+    except ImportError:
+        # pypinyin 未安装时，直接返回原名
+        return name
 
 
 def _extract_lesson(q: str) -> str:

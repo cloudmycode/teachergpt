@@ -29,7 +29,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = SCRIPT_DIR / "output"
 
 # 默认参数：跟 diaryofawimpykit/make_video.py 保持一致
-DEFAULT_VOICE = os.environ.get("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
+DEFAULT_VOICE = os.environ.get("TTS_VOICE", "zh-CN-YunfengNeural")
 DEFAULT_RATE = os.environ.get("TTS_RATE", "+10%")
 
 # 匹配 transcribe.py 输出格式: "12.34s → 56.78s | text"
