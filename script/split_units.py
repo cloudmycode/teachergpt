@@ -111,6 +111,7 @@ META_PROMPT = """下面是语文老师一段讲解的文字。
 
 
 def call_deepseek(cfg: dict, user_prompt: str) -> str:
+    import ssl
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": cfg["model"],
@@ -130,7 +131,11 @@ def call_deepseek(cfg: dict, user_prompt: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    # 跳过 SSL 验证（解决证书问题）
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=300, context=context) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
 

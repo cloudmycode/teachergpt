@@ -221,6 +221,7 @@ def build_user_prompt(lines: list[Line], base: int) -> str:
 
 def call_deepseek(cfg: dict, user_prompt: str) -> str:
     """调用 DeepSeek Chat（OpenAI 兼容）。返回模型文本内容。"""
+    import ssl
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": cfg["model"],
@@ -240,7 +241,11 @@ def call_deepseek(cfg: dict, user_prompt: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    # 跳过 SSL 验证（解决证书问题）
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=300, context=context) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
 
