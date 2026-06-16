@@ -99,8 +99,63 @@ def count_phrases(texts: list[str], top_k: int = 20) -> list[dict]:
 
 # ------------------------------------------------------------------- 2. 开场白 / 收尾句
 
+def _is_generic_opener(opener: str, lesson: str) -> bool:
+    """判断开场是否通用（不包含具体课文/课程名）。
+    
+    通用开场：大家好、同学们、好、同学们好
+    特定开场：我来继续讲《水浒传》、今天讲《背影》
+    """
+    # 提取课程名用于匹配
+    lesson_lower = lesson.lower()
+    
+    # 如果开场包含课程名，认为是特定开场
+    if lesson_lower in opener.lower():
+        return False
+    
+    # 如果开场以"今天讲"、"继续讲"、"我们来看"等引导词开头且包含课程相关内容，也过滤
+    specific_patterns = [
+        r"今天(讲|学|看)",
+        r"继续(讲|学|看)",
+        r"我们来(讲|学|看)",
+        r"这节课(讲|学|看)",
+        r"接下来看",
+        r"接下来讲",
+        r"《.+》",  # 包含书名号
+    ]
+    for pattern in specific_patterns:
+        if re.search(pattern, opener):
+            return False
+    
+    return True
+
+
+def _is_generic_closer(closer: str, lesson: str) -> bool:
+    """判断收尾是否通用（不包含具体课文/课程名）。
+    
+    通用收尾：好，我们下节课继续、谢谢大家、下课
+    特定收尾：今天《XXX》就讲到这里、《XXX》我们下次继续
+    """
+    # 提取课程名用于匹配
+    lesson_lower = lesson.lower()
+    
+    # 如果收尾包含课程名，认为是特定收尾
+    if lesson_lower in closer.lower():
+        return False
+    
+    # 过滤包含书名号的收尾
+    if re.search(r"《.+》", closer):
+        return False
+    
+    return True
+
+
 def extract_openers_closers(segs: list[dict]) -> dict:
-    """每节课首段首句、末段末句。"""
+    """每节课首段首句、末段末句。
+    
+    过滤规则：
+    1. 排重（相同开场只保留一个）
+    2. 过滤包含具体课文/课程名的特定开场
+    """
     # 按 lesson_slug（从 segment_id 提取）分组
     groups: dict[str, list[dict]] = defaultdict(list)
     for s in segs:
@@ -110,10 +165,25 @@ def extract_openers_closers(segs: list[dict]) -> dict:
 
     openers: list[str] = []
     closers: list[str] = []
+    seen_openers: set[str] = set()
+    seen_closers: set[str] = set()
+    
     for slug, group in groups.items():
-        if group:
-            openers.append(_first_sent(group[0]["text"]))
-            closers.append(_last_sent(group[-1]["text"]))
+        if not group:
+            continue
+        
+        first_sent = _first_sent(group[0]["text"])
+        last_sent = _last_sent(group[-1]["text"])
+        
+        # 开场：排重 + 过滤特定开场
+        if first_sent not in seen_openers and _is_generic_opener(first_sent, slug):
+            openers.append(first_sent)
+            seen_openers.add(first_sent)
+        
+        # 收尾：排重 + 过滤特定收尾
+        if last_sent not in seen_closers and _is_generic_closer(last_sent, slug):
+            closers.append(last_sent)
+            seen_closers.add(last_sent)
 
     return {
         "openers": openers[:30],

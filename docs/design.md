@@ -1,12 +1,12 @@
-# 克隆语文老师风格 —— 技术方案与实现路径
+# 通过微调大模型，实现AI语文老师 —— 技术方案与实现路径
 
-> 目标：用 ~1000 节课的 MP3 + Whisper 文本（带时间戳），做出一个尽量接近这位老师上课风格的模型输出，并工程化进产品，让它能讲任意指定的语文课。
+> 目标：用 ~1000 节课的 MP3 + Whisper 文本（带时间戳），做出一个尽量接近真实老师上课内容和风格的模型，并工程化进产品，让它能讲任意指定的语文课。
 
 ---
 
-## 0. 先把问题拆清楚
+## 0. 拆清问题
 
-"像这位老师"其实是三件不同的事，混在一起谈会导致方案选错：
+"真实老师"包含三个维度的特点：
 
 | 维度 | 含义 | 数据来源 | 难度 |
 |------|------|---------|------|
@@ -14,47 +14,24 @@
 | **教学法 Pedagogy** | 怎么导入、怎么拆段、提问设计、情感升华的套路 | 需从转录里结构化抽取 | 高 |
 | **知识 Knowledge** | 具体课文的讲法、考点、背景 | 部分在转录里，部分要外部教材补 | 中 |
 
-你说的"风格"，产品上真正打动人的其实是 **Style + Pedagogy**。知识可以靠 RAG 和底座模型补，本文只处理文本讲解风格。
-
-**关键判断：你手上最值钱的资产不是"能训模型"，而是 1000 节课真实讲法语料本身。** 方案的核心是怎么把这批语料用好，而不是用什么训练框架。
+产品上真正打动人的是 **Style + Pedagogy**。知识可以靠 RAG 和底座模型补，本文只处理文本讲解风格。
 
 ---
 
-## 1. 三种方案对比与结论
+## 1. 实现方案对
 
-### 方案 1：蒸馏 / 微调一个"老师大模型"
-把转录整理成指令-输出对，用 LoRA/QLoRA 在开源底座（Qwen2.5-7B/14B 等）上微调。
-
-- 优点：风格内化最深，输出稳定，不依赖每次塞长 prompt，推理便宜。
-- 缺点：
-  - 真正的工作量在**数据构造**（把口语独白变成 instruction→output 对），不在训练本身。
-  - 1000 节课的纯口播≈百万级 token，量够做风格 SFT，但**不够支撑"记住所有课文知识"**——硬塞知识会幻觉。
-  - 改一次风格/纠错要重新训，迭代慢。
-  - 需要 GPU 和一套训练/评估流程。
-- "蒸馏"这个词在你的场景里其实用词不准：蒸馏是用大模型教小模型。你这里是**用真人语料做风格微调（style SFT）**，不是蒸馏。
-
-### 方案 2：纯提示词模仿
-写一份风格指南 + few-shot 例子，挂在普通大模型上。
-
-- 优点：今天就能上线，零训练成本，随时改。
-- 缺点：
-  - 模型只是"演"这个风格，**深度不够**，长输出容易漂回通用腔。
-  - 风格指南是你"总结"出来的，会丢失真人语料里的大量细节。
-  - 知识仍然靠底座，照样幻觉。
-- 单独用它做不到"尽量接近"，但它是任何方案的起点和基线。
-
-### 方案 3（推荐）：RAG（真人语料检索）+ 风格 Prompt，跑通后再叠加 LoRA
-不是三选一，是**分阶段叠加**。核心思路：
+### RAG（真人语料检索）+ 风格 Prompt，跑通后再叠加 LoRA
+**分阶段叠加**。核心思路：
 
 > 让老师"讲过的真话"被检索出来当上下文，而不是让模型凭空模仿。
 
-- RAG 检索的是**他本人对相似课文/知识点的真实讲法片段**，模型基于真材料改写 → 风格和知识同时贴近，幻觉大幅下降。
+- RAG 检索的是**真实老师对课文/知识点的真实讲法片段**，模型基于真材料改写 → 风格和知识同时贴近，幻觉大幅下降。
 - 风格 Prompt 负责兜底语气和结构。
 - 当 RAG+Prompt 的风格保真度被验证为不够时，再用同一批语料做 LoRA，把风格"焊进"模型，RAG 继续负责知识。
 
 ---
 
-## 2. 推荐路线（按阶段，可随时止步）
+## 2. 落地路线（按阶段，可随时止步）
 
 ```
 阶段 A: 数据底座（必做，所有方案共用）
@@ -66,9 +43,6 @@
 阶段 C: LoRA 风格微调      → 当 B 的风格保真度不达标再做
    └─ RAG 继续管知识，LoRA 管风格
 ```
-
-止步原则：**A 必做；B 做完先评估，达标就停**；不达标再上 C。不要一上来就奔着训大模型去。
-
 ---
 
 ## 3. 阶段 A：数据底座（最重要，决定上限）
@@ -79,7 +53,7 @@
 
 这一步的目标：把 Whisper 原始输出（时间戳 + 带错字的口语文本）变成**可直接用于 RAG 和训练的干净结构化片段**。Whisper 原始文本常见问题：同音错别字（如"蹒跚"→"盘山"）、口语冗余、没有段落、专有名词错。
 
-#### 步骤 1：Whisper 转录（已完成）
+#### 步骤 1：Whisper 转录
 - 输入：每节课的 mp3 文件。
 - 工具：`asr/transcribe.py`（faster-whisper medium）。
 - 输出：每节课一个 txt，格式为 `start_time → end_time | 文本`，例如：
@@ -91,7 +65,7 @@
 
 #### 步骤 2：大模型纠错
 - 输入：Whisper 原始 txt + 对应的音频时间戳（用于必要时回听）。
-- 工具：DeepSeek / Qwen 等长上下文模型。
+- 工具：`script/clean_transcription.py`（依赖DeepSeek上下文模型）。
 - 方法：把同一节课的所有段作为一个上下文窗口送进模型，要求它：
   1. **纠正错别字**：结合上下文判断同音字，优先参考语文教材常见词。例如"盘山"→"蹒跚"。
   2. **修正专有名词**：课文名、作者名、典故名。可额外提供一份《语文课本人名地名词表》作为 few-shot 提示，提升准确率。
@@ -118,7 +92,8 @@
 - 质量兜底：对高频纠错词（如"盘山→蹒跚"）随机抽 10% 回听原始音频验证；低置信的可人工复核。
 
 #### 步骤 3：断句与段落合并
-- 输入：纠错后的 txt（多行为 Whisper 自动切分的短片段）。
+- 工具：`script/clean_transcription.py`（依赖DeepSeek上下文模型）。
+- 输入：步骤2纠错后的 txt（多行为 Whisper 自动切分的短片段）。
 - 目的：把碎片化的短句合并成**一个完整的讲解动作**（如"导入+提问""字词分析+追问"），便于后续切分检索单元。
 - 方法：用大模型做"句子级合并"——把相邻几行合并为一句/一段自然的话，同时保留时间戳范围：
   ```
@@ -134,7 +109,9 @@
 - 注意：合并时**不要丢弃时间戳**，取该段首行的 start、末行的 end。
 
 #### 步骤 4：结构化 & 标签
-- 输入：合并后的段落 + 该课的元信息（课名、课本版本、年级）。
+- 工具：`script/clean_transcription.py`（依赖DeepSeek上下文模型）。
+- 目的：把每段话打上标签，便于后续 RAG 检索。
+- 输入：步骤2合并后的段落 + 该课的元信息（课名、课本版本、年级）。
 - 方法：用大模型对每段做轻量分类，打标签。Prompt 示例：
   ```
   对下面这段语文课讲解打标签，可选：导入/背景/字词/句析/提问/互动/情感/总结/其他。
@@ -170,12 +147,18 @@
 ```
 
 #### 工程化
-- 上述步骤 2~4 可写成一个 pipeline 脚本，输入一节课的纠错后 txt，输出结构化 JSONL。建议放在 `script/` 下。
+- 步骤 2~4 可写成一个 pipeline 脚本 `clean_transcription.py` ，输入一节课的纠错后 txt，输出结构化 JSONL，放在chinese_clean目录下。
 - 可选：纠错和合并用大模型的 Batch API 跑，比单条调用便宜 5~10 倍，1000 节课几块钱成本。
+
+**依赖安装**：
+```bash
+# 无额外依赖，使用 Python 标准库 urllib 调用 API
+```
 
 ### A.2 切分成检索单元
 
-这一步的目标：把 A.1 产出的结构化段落，进一步切成**适合 RAG 检索的独立单元**。粒度不对会导致：太碎→召回上下文不完整；太粗→不同话题混在一起、检索不精准。
+这一步的目标：把 A.1 产出的结构化段落，进一步切成**适合 RAG 检索的独立单元**。保证粒度不对太粗或太细。太碎→召回上下文不完整；太粗→不同话题混在一起、检索不精准。
+- 工具：`script/split_units.py`（依赖DeepSeek上下文模型）。
 
 #### 步骤 1：确定切分粒度
 - 目标：每个单元 ≈ 一个"完整讲解动作"，例如"导入+抛问题""字词分析+追问""情感升华收尾"。
@@ -218,12 +201,14 @@
   2. **防幻觉素材**——生成时把权威原文一起喂给模型，避免它把课文背错、引错句子（呼应第 32 行的知识幻觉风险）。原文是"事实锚"，老师讲解是"风格锚"，两者分工。
   - 角色定位：`source_refs` 是**附加锚点**，不替代 `text`（讲解文本仍是主体）。
   - 抽取方式：先用 `entities`、老师讲解中的短引文、课文名和段落线索，在本地文章库里做精确/模糊匹配；匹配不到就留空。
-  - **前提**：必须有可信文章库或人工复核结果。不要依赖 DeepSeek/Qwen 等模型的训练记忆来补课文原句、段落号或出处。
+  - **前提**：必须有可信文章库或人工复核结果。不要依赖 DeepSeek 等模型的训练记忆来补课文原句、段落号或出处。
   - 对齐粒度：老师是跳着讲、引片段，不逐句念，所以做到**段落级 + 引用句**即可，不追求逐句严格对齐；拿不准的留空，靠下方"人工复核"环节顺带补。
 
-#### 步骤 4：导出为 JSONL
-- 每行一个 JSON 对象，便于后续批量向量化入库。
-- 文件命名：`segments_{lesson_slug}.jsonl`，或合并为一个 `segments_all.jsonl`。
+#### 步骤 4：把以上unit单元合并导出为 JSONL
+- 由 `script/split_units.py` 实现
+- 输入：`data/chinese_clean/<课程>/*.jsonl`（清洗后的段落）
+- 输出：`data/chinese_units/<课程>/*.jsonl`（检索单元，每行一个 JSON 对象）
+- 切分规则：tags 有交集则合并，无交集则切分；<200 字尝试合并，>1000 字在句号处再切
 
 #### 切分效果示例
 
@@ -252,22 +237,30 @@
 ```
 
 #### 工程化
-- 切分逻辑可写成一个脚本：读 JSONL → 按 tags 主题切换切分 → 补 summary/entities → 输出新的 JSONL；`source_refs` 等文章库建好后再回填。
-- `source_refs` 只能来自本地文章库匹配或人工复核。匹配置信度低、版本不确定、段落号不确定时一律留空。
-- 后续可加一个"人工复核"环节：随机抽 10% 切分结果，检查是否有不当切点（如把一个完整提问从中间切断）；文章库上线后再顺带核对 `source_refs` 原句对应是否正确。
+-   **输入**：`data/chinese_clean/<课程>/*.jsonl`（`clean_transcript.py` 的输出）
+-   **输出**：`data/chinese_units/<课程>/*.jsonl`（检索单元）
+-   脚本：`script/split_units.py`
+-   `python3 script/split_units.py` — 处理全部；
+-   `python3 script/split_units.py --file xxx.jsonl` — 单文件；
+-   `python3 script/split_units.py --dry-run` — 仅切分不调模型；
+-   `python3 script/split_units.py --sample-check 0.1` — 切分后抽 10% 打印摘要供人工复核。
 
-> **已实现**：`script/split_units.py`。用法：
->   `python3 script/split_units.py` — 处理全部；
->   `python3 script/split_units.py --file xxx.jsonl` — 单文件；
->   `python3 script/split_units.py --dry-run` — 仅切分不调模型；
->   `python3 script/split_units.py --sample-check 0.1` — 切分后抽 10% 打印摘要供人工复核。
+**依赖安装**：
+```bash
+# 无额外依赖，使用 Python 标准库 urllib 调用 API
+```
+
+> `source_refs` 只能来自本地文章库匹配或人工复核。匹配置信度低、版本不确定、段落号不确定时一律留空。
+> 后续可加一个"人工复核"环节：随机抽 10% 切分结果，检查是否有不当切点（如把一个完整提问从中间切断）；文章库上线后再顺带核对 `source_refs` 原句对应是否正确。
 
 ### A.3 风格画像（给 Prompt 和评估用）
 
 #### 这一步在干什么
-从全量语料里**离线**提炼出一份《老师风格档案》（一个结构化 JSON / Markdown）。它是对"这位老师怎么说话、怎么上课"的可复用描述，后面有三个用途：喂给阶段 B 的 System Prompt、当阶段 C 训练数据的指令模板、当评估时判断"像不像"的标尺。
+从全量语料里**离线**提炼出一份《老师风格档案》（一个结构化 JSON / Markdown）。它是对"真实老师怎么说话、怎么上课"的可复用描述，后面有三个用途：喂给阶段 B 的 System Prompt、当阶段 C 训练数据的指令模板、当评估时判断"像不像"的标尺。
 
-关键原则：**能靠程序统计得到的就别让模型编，能靠真实语料归纳的就别凭感觉写。** 所以分两条腿：①程序统计（客观、可量化）②大模型归纳（主观、需人工校对）。
+关键原则：**能靠程序统计得到的就别让模型编，能靠真实语料归纳的就别凭感觉写。** 所以分两条腿：
+- ①程序统计（客观、可量化）
+- ②大模型归纳（主观、需人工校对）。
 
 #### 第一条腿：程序统计（不调模型，纯代码跑）
 这些维度直接从清洗后的语料用代码算，结果客观、还能复用为评估指标：
@@ -282,8 +275,15 @@
 
 这些数字本身就是阶段 6 评估里"风格保真度"的自动指标，一举两得。
 
-> **已实现**：`script/style_stats.py`。输出 `data/style/style_stats.json` 或 `--out stats.md`。
-> 用法：`python3 script/style_stats.py` | `--top-k 30` | `--out stats.md`。
+> **已实现**：`script/style_stats.py`。
+> - **输入**：`data/chinese_clean/<课程>/*.jsonl`（`clean_transcript.py` 的输出）
+> - **输出**：`data/style/style_stats.json` 或 `--out stats.md`
+> - **用法**：`python3 script/style_stats.py` | `--top-k 30` | `--out stats.md`。
+> 
+> **依赖安装**：
+> ```bash
+> pip3 install jieba
+> ```
 
 #### 第二条腿：大模型归纳（统计算不出的"套路"靠它）
 讲解结构、举例偏好、情感表达这类"软"特征，统计抽不出来，用大模型读真实片段归纳。
@@ -330,13 +330,20 @@
 - 跑分批归纳再合并：50 段一批跑几批，结果取交集/高频项，比一次塞太多更稳。
 - 这份档案是"活"的，阶段 B 上线后发现哪条风格没抓准，回来改档案即可，成本极低。
 
-> **已实现**：`script/style_profile.py`（第二条腿）。依赖 `script/style_stats.py` 先产出统计数据。
-> 用法：`python3 script/style_stats.py && python3 script/style_profile.py --batches 3 && python3 script/style_profile.py --merge` | `--samples 50` | `--dry-run`。
+> **已实现**：`script/style_profile.py`（第二条腿）。
+> - **输入**：`data/style/style_stats.json`（`style_stats.py` 的输出）+ `data/chinese_clean/<课程>/*.jsonl`
+> - **输出**：`data/style/style_profile.json`（结构化风格档案）
+> - **用法**：`python3 script/style_stats.py && python3 script/style_profile.py --batches 3 && python3 script/style_profile.py --merge` | `--samples 50` | `--dry-run`。
+> 
+> **依赖安装**：
+> ```bash
+> # 无额外依赖，使用 Python 标准库 urllib 调用 API
+> ```
 
-#### 三个用途回顾
-1. **阶段 B Prompt**：整段塞进 System，告诉模型"你要这样说话"。
-2. **阶段 C 训练**：用"讲解结构""提问方式"等当 instruction 模板，构造训练对。
-3. **评估**：第一条腿的统计项直接当自动指标（口头禅命中率、句长分布、互动密度对比真实留出集）。
+#### 产出物用途回顾
+1. **给阶段 B Prompt**：整段塞进 System，告诉模型"你要这样说话"。
+2. **给阶段 C 训练**：用"讲解结构""提问方式"等当 instruction 模板，构造训练对。
+3. **用于评估**：第一条腿的统计项直接当自动指标（口头禅命中率、句长分布、互动密度对比真实留出集）。
 
 ---
 
@@ -345,7 +352,7 @@
 ### B.1 索引（离线，一次性跑完）
 
 #### 这一步在干什么
-用户问"讲《背影》第二段"时，我们要从 A 里几万条片段中，快速找出**老师真正讲过的、和这个任务最相关的几段话**。问题是：用关键词匹配（如 MySQL `LIKE`、Elasticsearch 全文）只能匹配字面词，匹配不了语义——比如用户问"父爱的细节描写"，老师原话是"父亲爬月台买橘子那段"，字面不重合，关键词搜不到，但语义高度相关。
+当用户问"讲《背影》第二段"时，我们要从 A 里几万条片段中，快速找出**老师真正讲过的、和这个任务最相关的几段话**。问题是：用关键词匹配（如 MySQL `LIKE`、Elasticsearch 全文）只能匹配字面词，匹配不了语义——比如用户问"父爱的细节描写"，老师原话是"父亲爬月台买橘子那段"，字面不重合，关键词搜不到，但语义高度相关。
 
 **Embedding（向量化）就是解决这个问题的：** 把每段文本用一个模型转成一串浮点数（比如 1024 维的向量），语义相近的文本，向量在空间里距离也近。检索时把用户的 query 也转成向量，去向量库里找**距离最近的 top-k 段**，就能召回语义相关的真实讲解。
 
@@ -357,8 +364,7 @@
 - **注意：建库和查询必须用同一个 embedding 模型**，换模型要全量重建索引。
 
 #### 步骤 2：选择向量库
-- 数据量不大（几万~几十万段）：**Chroma**（本地零运维，最快上手）或 **PGVector**（已经在用 Postgres 就直接加扩展，省一个组件）。
-- 别一上来就上 Milvus——那是千万级以上、要分布式才需要的，MVP 阶段是过度工程。
+- 数据量不大（几万~几十万段）：**Chroma**（本地零运维，最快上手）。
 
 #### 步骤 3：批量向量化入库
 
@@ -367,63 +373,28 @@
 
 - 读 A.2 JSONL，编码 `text`。
 - metadata 里保存 lesson + tags + summary；文章库建好并回填 `source_refs` 后，再额外保存 para（从 `source_refs` 提取的段落号），用于精确过滤。
-- 代码示例：
 
-```python
-from sentence_transformers import SentenceTransformer
-import chromadb, json
+**已实现**：`script/build_index.py`（调度 `bge/encode.py` 的 Encoder）。
+用法：`python3 script/build_index.py`（增量）| `--rebuild`（重建）| `--dry-run` | `--model-dir ./bge/models`。
 
-model = SentenceTransformer("BAAI/bge-large-zh-v1.5")
-
-client = chromadb.PersistentClient(path="./vecdb")
-col = client.get_or_create_collection(
-    name="teacher_units",
-    metadata={"hnsw:space": "cosine"}
-)
-
-units = [json.loads(l) for l in open("segments_all.jsonl")]
-
-texts = [u["text"] for u in units]
-embeddings = model.encode(texts, normalize_embeddings=True, batch_size=64).tolist()
-
-col.add(
-    ids=[u["unit_id"] for u in units],
-    embeddings=embeddings,
-    documents=texts,
-    metadatas=[{
-        "lesson": u["lesson"],
-        "t_start": u["t_start"],
-        "tags": ",".join(u.get("tags", [])),
-        "summary": u.get("summary", ""),
-        "paras": ",".join(str(r["para"]) for r in u.get("source_refs", []) if "para" in r),
-    } for u in units]
-)
+**依赖安装**：
+```bash
+pip3 install chromadb sentence-transformers huggingface-hub
 ```
 
-> **已实现**：`script/build_index.py`（调度 `bge/encode.py` 的 Encoder）。
-> 用法：`python3 script/build_index.py`（增量）| `--rebuild`（重建）| `--dry-run` | `--model-dir ./bge/models`。
-
-#### 步骤 4：加 reranker（精排模型，强烈建议）
+#### 步骤 4：加 reranker（精排模型）
 向量召回（top-20）是"粗筛"，速度快但有时把不够相关的也召回了。再用 **`bge-reranker-v2-m3`** 这种交叉编码器，对 query 和每个候选段两两打分，重排后取真正最相关的 top-N（如 N=3~5）塞进 Prompt：
-
-```python
-from sentence_transformers import CrossEncoder
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
-
-pairs = [[user_query, doc] for doc in hits["documents"][0]]
-scores = reranker.predict(pairs)
-top = [doc for _, doc in sorted(zip(scores, hits["documents"][0]), reverse=True)][:5]
-```
 
 "粗召回(向量, top-20) → 精排(reranker, top-5)"是 RAG 的标准两段式，能明显提升喂给 LLM 的上下文质量。
 
-> **已实现**：`script/search.py` 支持 `--rerank` 启用两段式检索。首次运行会下载 `bge-reranker-v2-m3`（~2.3GB）。
+**已实现**：`script/search.py` 支持 `--rerank` 启用两段式检索。首次运行会下载 `bge-reranker-v2-m3`（~2.3GB）。 
+> search.py为测试效果使用，不参与工程化。
 
 #### 步骤 5：增量更新
 - 新转录的课随时 `col.add` 增量入库，不用全量重跑。
 - 只有在**换 embedding 模型**或**改切分粒度**时才需要全量重建索引。
 
-> **已实现**：`script/build_index.py` 默认增量模式（跳过已入库 unit_id）。换模型用 `--rebuild`。
+**已实现**：`script/build_index.py` 默认增量模式（跳过已入库 unit_id）。换模型用 `--rebuild`。
 
 ### B.2 在线流程（用户请求时跑）
 
@@ -505,8 +476,15 @@ top = [doc for _, doc in sorted(zip(scores, hits["documents"][0]), reverse=True)
 好，我们来看《背影》第二段。同学们注意啊，这一段写的是父亲送"我"到浦口车站，买橘子的那个场景——你们体会一下，作者为什么要把父亲的背影写得这么细？"他用两手攀着上面，两脚再向上缩"，每一个动词都不要放过。你们想想，父亲那时候多大年纪了？身体又不好，还坚持去买橘子——是不是特别让人心酸？
 ```
 
-> **已实现**：`script/generate.py`。端到端流程：意图解析（规则+模型）→ 向量检索（+可选reranker）→ 风格Prompt组装 → LLM生成。
-> 用法：`python3 script/generate.py "讲德行篇第25则"` | `--rerank` | `--lesson "世说新语精读"` | `-v`。
+**已实现**：`script/generate.py`。端到端流程：意图解析（规则+模型）→ 向量检索（+可选reranker）→ 风格Prompt组装 → LLM生成。
+用法：`python3 script/generate.py "讲德行篇第25则"` | `--rerank` | `--lesson "世说新语精读"` | `-v`。
+> generate.py为效果测试代码，不参与工程化。
+
+**依赖安装**：
+```bash
+# 无额外依赖，复用 B.1 的 chromadb + sentence-transformers
+# DeepSeek API 调用使用 Python 标准库 urllib
+```
 
 ### B.3 Prompt 结构（要点）
 - System：角色设定 + 风格档案（口头禅/句式/讲解套路）。
@@ -517,7 +495,7 @@ top = [doc for _, doc in sorted(zip(scores, hits["documents"][0]), reverse=True)
 
 ---
 
-## 5. 阶段 C：LoRA 风格微调（B 不达标再做）
+## 5. 阶段 C：LoRA 风格微调
 
 ### C.1 训练数据构造（核心难点）
 
@@ -677,21 +655,26 @@ llamafactory-cli train qwen2.5-7b-instruct.yaml
 不需要照搬企业级 SaaS。单租户起步的最小可用架构：
 
 ```
-Client
+Client（一个输入框）
   ↓
-API (FastAPI)  ── /teacher/lesson
-  ↓
-Orchestrator
-  ├─ Retriever (向量库 + rerank)
-  ├─ PromptBuilder (风格档案 + 检索片段)
-  └─ LLM (vLLM 部署微调后/底座模型)
-  ↓
-Response (流式返回，课堂体验更好)
+API (FastAPI: server/app.py)
+  ├─ 输入长度/范围校验：太长则返回 need_scope，要求用户细化到段落/章节
+  ├─ 匿名任务创建：task_id + token + client_id
+  └─ 后台生成任务（SQLite 持久化状态）
+        ↓
+      build_timeline.py 生成 timeline + 音频
+        ↓
+      build_pptx.py 生成 PPTX
+        ↓
+      build_player.py 生成 HTML 预览
+        ↓
+      页面轮询任务状态 → 展示 HTML 预览 + 下载 PPT
 
 旁路:
+  - SQLite 任务库：data/output/tasks.sqlite3
+  - 时间轴/音频/PPT/播放器：data/timelines/
   - 向量库 (Chroma/PGVector)
   - 风格档案 (静态配置/DB)
-  - 缓存 (相同课文/段落结果缓存)
 ```
 
 ### 7.1 技术选型
@@ -703,16 +686,18 @@ Response (流式返回，课堂体验更好)
 | Embedding 模型 | bge-large-zh-v1.5 | 中文语义检索，和 B.1 一致 |
 | Reranker | bge-reranker-v2-m3 | 精排，提升检索质量 |
 | LLM 推理 | vLLM | 高吞吐、支持流式、LoRA 热加载 |
+| 匿名任务 | SQLite | MVP 阶段持久化任务状态，页面关闭后可恢复 |
 | 缓存 | Redis（可选） | 相同 query 直接返回缓存结果 |
 
 ### 7.2 项目结构（建议）
 
 ```
 teacher-clone/
-├── api/                    # FastAPI 服务
-│   ├── main.py            # 入口
-│   └── routes/
-│       └── lesson.py      # POST /teacher/lesson
+├── server/                 # 当前 Web 服务
+│   ├── app.py              # FastAPI 入口，匿名任务、状态查询、下载/预览
+│   ├── requirements.txt    # Web 服务依赖
+│   └── static/
+│       └── index.html      # 单输入框页面
 ├── core/                   # 核心逻辑
 │   ├── retriever.py       # 向量检索 + rerank
 │   ├── prompt_builder.py  # Prompt 组装
@@ -722,6 +707,9 @@ teacher-clone/
 │   │   ├── style_stats.json
 │   │   ├── style_profile.json
 │   │   └── style_profile_batch_*.json
+│   ├── output/
+│   │   └── tasks.sqlite3  # 匿名任务状态库
+│   ├── timelines/         # timeline/audio/player.html/pptx 输出
 │   ├── segments.jsonl     # 阶段 A.2 产出
 │   └── vecdb/             # Chroma 向量库（运行时生成）
 ├── models/                 # 模型权重
@@ -731,36 +719,82 @@ teacher-clone/
     └── settings.yaml      # 配置（模型路径、API key 等）
 ```
 
-### 7.3 API 接口设计
+### 7.3 API 接口设计（当前 server）
 
-#### POST /teacher/lesson
+#### POST /api/generate
 
 请求：
 ```json
 {
-  "lesson": "背影",
-  "scope": "第二段",
-  "mode": "精读"
+  "lesson": "木兰词 第一段",
+  "client_id": "浏览器本地生成的匿名 UUID"
 }
 ```
 
-响应（流式 SSE）：
+响应（创建任务）：
+```json
+{
+  "task_id": "uuid",
+  "token": "secret",
+  "status": "pending",
+  "message": "任务已提交，正在排队生成...",
+  "recover_url": "/task/{task_id}?token={secret}"
+}
 ```
-data: 好，我们来看《背影》第二段。
 
-data: 同学们注意啊，这一段写的是父亲送"我"到浦口车站...
-
-data: [DONE]
+如果输入内容太长且没有具体范围：
+```json
+{
+  "status": "need_scope",
+  "message": "输入内容较长，整篇生成会很慢。请具体到段落或章节..."
+}
 ```
 
-### 7.4 性能预估
+#### GET /api/task/{task_id}?token=...
+
+查询任务状态。`token` 是匿名访问凭证，避免别人猜到 `task_id` 后下载文件。
+
+#### GET /api/preview/{task_id}?token=...
+
+返回生成好的 HTML 播放器，页面用 iframe 展示。
+
+#### GET /api/download/{task_id}?token=...
+
+下载生成好的 PPTX。
+
+#### GET /task/{task_id}?token=...
+
+恢复链接入口。用户关掉页面后，只要保存这个链接，就能回来查看生成结果。
+
+### 7.4 匿名用户与任务恢复
+
+用户不登录时，用两层机制恢复任务：
+
+1. 前端第一次打开页面时生成 `client_id`，保存到 `localStorage`。
+2. 每次生成任务时，后端生成 `task_id + token`，写入 `data/output/tasks.sqlite3`。
+3. 页面关闭后再次打开，前端从 `localStorage` 读取最近任务并轮询状态。
+4. 换浏览器或清缓存时，用户可通过 `/task/{task_id}?token=...` 恢复。
+
+`task_id` 只用于定位任务，`token` 才是访问凭证；下载和预览都必须带 token。
+
+### 7.5 长文本输入策略
+
+页面仍然只展示一个输入框，但后端要先做范围校验：
+
+- 用户输入短课文名或明确范围，如 `木兰词 第一段`、`出师表 第1-3段`：创建生成任务。
+- 用户粘贴很长文章，且没有出现段/章/节/则/句等范围：返回 `need_scope`，要求用户细化。
+- 这样避免整篇长文触发超长讲解、TTS 和 PPT 生成，导致等待时间过长。
+
+### 7.6 性能预估
 - 检索（向量 + rerank）：20~50ms。
 - Prompt 组装：1~2ms。
 - LLM 生成（流式）：按 token 速率约 30~50 token/s，300 字约 6~10 秒。
-- **总延迟**：首 token 延迟约 100ms（检索+组装）+ LLM 首 token 延迟约 1~2s，之后流式返回。
+- PPT 生成链路：取决于原文长度、逐句讲稿生成、TTS 和 PPT 写入，必须作为后台任务执行。
+- **总体验**：前端提交后立即拿到恢复链接；页面轮询状态，完成后展示 HTML 预览和 PPT 下载按钮。
 
-### 7.5 扩展路径
+### 7.7 扩展路径
 - 后续要多老师/多租户、计费、Marketplace 再演进（可参考 design.gpt.md 里的扩展设想，但别在 MVP 阶段背这些包袱）。
+- SQLite 适合单机 MVP；多实例部署时改为 Redis/Postgres，并把生成文件放对象存储。
 
 ---
 
@@ -799,7 +833,12 @@ timeline.json（含 narration / audio / duration / keyword_timings）
 
 #### 11.3.1 步骤 1：按句生成讲解
 
-`script/build_timeline.py` 逐句调 DeepSeek，带全文上下文 + 上一句结尾，输出到 `data/timelines/{课文名}/timeline.json`。每句拿到 `narration` 后进入下一步。
+`script/build_timeline.py` 逐句调 DeepSeek，带全文上下文 + 上一句结尾，输出到 `data/timelines/{拼音}/timeline.json`。每句拿到 `narration` 后进入下一步。
+
+**依赖安装**：
+```bash
+pip3 install edge-tts mutagen pypinyin
+```
 
 #### 11.3.2 步骤 2：TTS 合成
 
@@ -863,6 +902,11 @@ python3 script/build_player.py "诫子书" --out player.html
 
 浏览器直开，不需要编译，适合快速验证和在线课程。
 
+**依赖安装**：
+```bash
+# 无额外依赖，纯 HTML + JS
+```
+
 #### 11.4.2 PPT（`build_pptx.py`）
 
 `python-pptx` 逐句生成幻灯片，原文区 + 讲解区 + 关键词标注。**已实现嵌入旁白 + 自动播放**，导出视频可带声音。
@@ -883,6 +927,11 @@ python3 script/build_pptx.py "诫子书" --out 诫子书.pptx
 - 每页时长 = 旁白时长（`transition advTm`）
 - 透明 1x1 图标媒体对象放在页面内极小尺寸（0,0,9144x9144），不显示图标
 - 用 PowerPoint 打开后「文件→导出→创建视频」即可得到带声 MP4
+
+**依赖安装**：
+```bash
+pip3 install python-pptx
+```
 
 > python-pptx 需指定中文字体（`run.font.name = "PingFang SC"` 等）。`run` 只能整段设样式，不能逐字高亮——所以要先把原文拆成普通段和高亮段再分别添加 `run`。
 
@@ -952,26 +1001,41 @@ python3 script/build_timeline.py "诫子书" --skip-align
 - `edge-tts` 提供云端 TTS 合成
 - 线性估时对齐（零额外依赖）
 
-**输出**：`data/timelines/{课文名}/` 目录下 `timeline.json` + `audio/*.mp3`。
+**输出**：`data/timelines/{拼音}/` 目录下 `timeline.json` + `audio/*.mp3`。
+
+**依赖安装**：
+```bash
+# 复用 11.3.1 的依赖：edge-tts, mutagen, pypinyin
+```
 
 #### 11.5.2 HTML 播放器（`build_player.py`）
 
+**依赖安装**：
+```bash
+# 无额外依赖，纯 HTML + JS
+```
+
 #### 11.5.3 PPT 生成（`build_pptx.py`）
+
+**依赖安装**：
+```bash
+pip3 install python-pptx
+```
 
 ### 11.6 脚本清单
 
 | 脚本 | 用途 | 依赖 |
 |---|---|---|
 | `script/generate.py` | B.2 在线生成：意图解析→检索→Prompt→LLM | DeepSeek API、BGE、ChromaDB |
-| `script/build_timeline.py` | 讲解时间轴生成：按句生成+TTS+对齐 | DeepSeek API、edge-tts、mutagen |
+| `script/build_timeline.py` | 讲解时间轴生成：按句生成+TTS+对齐 | DeepSeek API、edge-tts、mutagen、pypinyin |
 | `script/build_player.py` | HTML 播放器生成 | 无 |
 | `script/build_pptx.py` | PPT 生成（含嵌入旁白+自动播放） | python-pptx |
 | `script/search.py` | 语义搜索：BGE 编码→ChromaDB 检索→可选 rerank | BGE、ChromaDB、bge-reranker |
 | `script/build_index.py` | 向量索引构建：批量编码+入库 | BGE、ChromaDB |
 | `script/split_units.py` | 检索单元切分 | 无 |
-| `script/style_stats.py` | 风格统计（程序统计） | 无 |
-| `script/style_profile.py` | 风格画像（大模型归纳） | 大模型 API |
-| `script/transcribe_dir.py` | 批量转录 | faster-whisper |
+| `script/style_stats.py` | 风格统计（程序统计） | jieba |
+| `script/style_profile.py` | 风格画像（大模型归纳） | 无 |
+| `script/transcribe.py` | 批量转录 | faster-whisper |
 | `script/test_keyword_pos.py` | 关键词定位调试 | faster-whisper |
 
 ### 11.7 依赖关系
@@ -1004,7 +1068,7 @@ python3.11 -m venv venv
 source venv/bin/activate
 
 # 项目依赖
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 #### 11.8.3 模型文件
@@ -1013,7 +1077,7 @@ pip install -r requirements.txt
 
 | 模型 | 位置 | 大小 | 下载方式 |
 |---|---|---|---|
-| BGE Embedding | `bge/models/` | ~1.3GB | `python bge/download_model.py --download` |
+| BGE Embedding | `bge/models/` | ~1.3GB | `python3 bge/download_model.py --download` |
 
 #### 11.8.4 外部服务
 
@@ -1043,7 +1107,8 @@ apt install ffmpeg         # Ubuntu
 python3.11 -m venv venv && source venv/bin/activate
 
 # 3. 项目依赖
-pip install -r requirements.txt
+pip3 install -r requirements.txt
+pip3 install -r server/requirements.txt
 
 # 4. 下载 BGE 模型（服务器上直接下载，HuggingFace 公开模型）
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-zh-v1.5')"
@@ -1059,6 +1124,9 @@ python3 script/build_timeline.py "诫子书 全文"
 # 7. 生成 HTML 播放器 / PPT
 python3 script/build_player.py "诫子书 全文"
 python3 script/build_pptx.py "诫子书 全文"
+
+# 8. 启动 Web 服务
+python3 -m uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
 #### 11.8.7 脚本执行顺序
@@ -1066,9 +1134,12 @@ python3 script/build_pptx.py "诫子书 全文"
 **在线生成流程**（Web 服务）：
 
 ```
-用户输入"木兰词"
+用户输入"木兰词 第一段"
       ↓
 [server/app.py] POST /api/generate
+      ├── 输入过长且没有范围 → 返回 need_scope
+      ├── 创建匿名任务 task_id + token
+      └── 写入 data/output/tasks.sqlite3
       ↓
 [script/build_timeline.py] 生成时间轴
       ├── [script/generate.py] 获取课文信息
@@ -1083,6 +1154,29 @@ python3 script/build_pptx.py "诫子书 全文"
       ├── 读取 timeline.json
       ├── 读取音频文件
       └── 输出 {lesson}.pptx
+      ↓
+[script/build_player.py] 生成 HTML 预览
+      └── 输出 player.html
+      ↓
+前端轮询 /api/task/{task_id}?token=...
+      ├── 完成后 iframe 展示 /api/preview/{task_id}?token=...
+      └── 下载 /api/download/{task_id}?token=...
+```
+
+**匿名任务恢复**：
+
+```
+浏览器首次访问
+      ↓
+localStorage 生成 client_id
+      ↓
+提交任务时把 client_id 发给 /api/generate
+      ↓
+后端返回 recover_url: /task/{task_id}?token=...
+      ↓
+页面关闭后：
+  - 同一浏览器：localStorage 自动恢复最近任务
+  - 换浏览器/清缓存：用户打开 recover_url 恢复
 ```
 
 **离线训练流程**（从原始音频构建语料库）：
@@ -1112,6 +1206,9 @@ python3 script/build_pptx.py "诫子书 全文"
 | `build_timeline.py` | 在线生成入口：协调讲解词+TTS+时间轴 |
 | `build_pptx.py` | 生成 PPT 文件 |
 | `build_player.py` | 生成播放器 HTML |
+| `server/app.py` | Web 服务：提交任务、轮询状态、预览和下载 |
+| `server/static/index.html` | 单输入框页面：匿名恢复、状态轮询、预览展示 |
+| `data/output/tasks.sqlite3` | SQLite 任务状态库，运行时自动创建 |
 | `config.toml` | API Key、模型配置 |
 
 #### 11.8.8 本地 vs 服务器文件
@@ -1119,8 +1216,11 @@ python3 script/build_pptx.py "诫子书 全文"
 | 文件 | 需要上传到服务器 | 说明 |
 |---|---|---|
 | `script/` | ✅ | 脚本代码 |
+| `server/` | ✅ | Web 服务和静态页面 |
 | `data/vecdb/` | ✅ | 本地跑出来的向量库（~2.5MB） |
 | `data/style_profile.json` | ✅ | 风格画像（如有） |
 | `config.toml` | ✅ | API Key 配置 |
+| `data/output/tasks.sqlite3` | ❌ | 运行时任务库，服务器自动创建 |
+| `data/timelines/` | 视情况 | 生成结果目录；迁移历史任务时需要上传 |
 | `asr/models/` | ❌ | ASR 离线用，线上不需要 |
 | `bge/models/` | ❌ | 服务器上直接下载即可 |
