@@ -210,8 +210,48 @@ def _extract_lesson(q: str) -> str:
     m = re.search(r"《(.+?)》", q)
     if m:
         return m.group(1)
+    
+    # 篇名到课程的映射（世说新语的篇名 → 世说新语精读）
+    chapter_to_course = {
+        "德行篇": "世说新语精读",
+        "言语篇": "世说新语精读",
+        "政事篇": "世说新语精读",
+        "文学篇": "世说新语精读",
+        "方正篇": "世说新语精读",
+        "雅量篇": "世说新语精读",
+        "识鉴篇": "世说新语精读",
+        "赏誉篇": "世说新语精读",
+        "品藻篇": "世说新语精读",
+        "规箴篇": "世说新语精读",
+        "捷悟篇": "世说新语精读",
+        "夙慧篇": "世说新语精读",
+        "豪爽篇": "世说新语精读",
+        "容止篇": "世说新语精读",
+        "自新篇": "世说新语精读",
+        "俭啬篇": "世说新语精读",
+        "汰侈篇": "世说新语精读",
+        "忿狷篇": "世说新语精读",
+        "情礼篇": "世说新语精读",
+        "黜免篇": "世说新语精读",
+        "俭吝篇": "世说新语精读",
+        "惑溺篇": "世说新语精读",
+        "仇隙篇": "世说新语精读",
+        "任诞篇": "世说新语精读",
+        "伤逝篇": "世说新语精读",
+        "栖逸篇": "世说新语精读",
+        "贤媛篇": "世说新语精读",
+        "术解篇": "世说新语精读",
+        "巧艺篇": "世说新语精读",
+        "知惧篇": "世说新语精读",
+        "企羡篇": "世说新语精读",
+        "黜免篇": "世说新语精读",
+    }
+    for chapter, course in chapter_to_course.items():
+        if chapter in q:
+            return course
+    
     # 已知课程名
-    courses = ["世说新语", "背影", "滕王阁序", "诫子书", "爱莲说", "陋室铭", "桃花源记", "岳阳楼记", "醉翁亭记"]
+    courses = ["世说新语", "背影", "滕王阁序", "诫子书", "爱莲说", "陋室铭", "桃花源记", "岳阳楼记", "醉翁亭记", "木兰诗", "木兰辞"]
     for c in courses:
         if c in q:
             return c
@@ -248,6 +288,7 @@ def _intent_prompt(q: str) -> str:
 def retrieve(
     query: str, intent: dict, enc: Encoder,
     top: int = 5, rerank: bool = False,
+    verbose: bool = False,
 ) -> list[dict]:
     """向量检索 + 可选 rerank，返回 top-N 段。"""
     import chromadb
@@ -271,6 +312,30 @@ def retrieve(
     docs = res["documents"][0]
     metas = res["metadatas"][0]
     ids = res["ids"][0]
+    distances = res["distances"][0] if res.get("distances") else [0.0] * len(ids)
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"ChromaDB 查询详情")
+        print(f"{'='*60}")
+        print(f"  集合: teacher_units")
+        print(f"  总单元数: {col.count()}")
+        print(f"  查询文本: {q_text}")
+        print(f"  过滤条件: {where or '无'}")
+        print(f"  召回数量: {len(docs)}")
+        print(f"  是否 rerank: {rerank}")
+        print(f"{'='*60}")
+        print(f"\n召回结果（按相似度排序）:")
+        for i, (did, doc, meta, dist) in enumerate(zip(ids, docs, metas, distances)):
+            similarity = 1 - dist
+            print(f"\n  [{i+1}] unit_id: {did}")
+            print(f"      lesson: {meta.get('lesson', 'N/A')}")
+            print(f"      tags: {meta.get('tags', 'N/A')}")
+            print(f"      summary: {meta.get('summary', 'N/A')[:80]}...")
+            print(f"      paras: {meta.get('paras', 'N/A')}")
+            print(f"      相似度: {similarity:.4f} (距离: {dist:.4f})")
+            text_preview = doc[:200].replace('\n', ' ')
+            print(f"      文本: {text_preview}...")
 
     if rerank and len(docs) > top:
         import os
@@ -280,14 +345,39 @@ def retrieve(
         pairs = [[query, d] for d in docs]
         scores = reranker.predict(pairs)
         ranked = sorted(zip(scores, ids, docs, metas), reverse=True)[:top]
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Rerank 精排结果 (top-{top})")
+            print(f"{'='*60}")
+            for i, (r_score, r_id, r_doc, r_meta) in enumerate(ranked):
+                print(f"\n  [{i+1}] unit_id: {r_id}")
+                print(f"      rerank 分数: {r_score:.4f}")
+                print(f"      lesson: {r_meta.get('lesson', 'N/A')}")
+                print(f"      tags: {r_meta.get('tags', 'N/A')}")
+                text_preview = r_doc[:150].replace('\n', ' ')
+                print(f"      文本: {text_preview}...")
+        
         return [
             {"id": r_id, "text": r_doc, "meta": r_meta, "score": float(r_score)}
             for r_score, r_id, r_doc, r_meta in ranked
         ]
 
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"最终检索结果 (top-{top})")
+        print(f"{'='*60}")
+        for i, (did, doc, meta, dist) in enumerate(zip(ids[:top], docs[:top], metas[:top], distances[:top])):
+            print(f"\n  [{i+1}] unit_id: {did}")
+            print(f"      lesson: {meta.get('lesson', 'N/A')}")
+            print(f"      tags: {meta.get('tags', 'N/A')}")
+            print(f"      相似度: {1-dist:.4f}")
+            text_preview = doc[:200].replace('\n', ' ')
+            print(f"      文本: {text_preview}...")
+
     return [
         {"id": did, "text": doc, "meta": meta}
-        for did, doc, meta in zip(ids, docs, metas)
+        for did, doc, meta in zip(ids[:top], docs[:top], metas[:top])
     ]
 
 
@@ -420,6 +510,50 @@ def build_prompt(
 
 # ------------------------------------------------------------------- main
 
+TIMELINES_DIR = PROJECT_ROOT / "data" / "timelines"
+
+
+def save_output(result: str, intent: dict, query: str) -> str:
+    """保存生成结果到 data/timelines/<课程拼音>/<章节拼音>/ 目录
+    
+    返回保存的文件路径
+    """
+    lesson = intent.get("lesson", "unknown")
+    lesson_pinyin = lesson_name_to_pinyin(lesson)
+    
+    # 从 query 中提取章节信息（如"德行篇第25则"、"009-第09讲"等）
+    chapter = intent.get("chapter", "")
+    if not chapter:
+        # 尝试从 query 中提取章节
+        import re
+        # 匹配"德行篇"、"第25则"、"009-第09讲"等格式
+        m = re.search(r"([\u4e00-\u9fa5]+篇|第?\d+-?第?\d+讲|第?\d+则)", query)
+        if m:
+            chapter = m.group(1)
+    
+    chapter_pinyin = lesson_name_to_pinyin(chapter) if chapter else "default"
+    
+    # 创建目录：data/timelines/<课程拼音>/<章节拼音>/
+    course_dir = TIMELINES_DIR / lesson_pinyin / chapter_pinyin
+    course_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 生成文件名：用时间戳
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{timestamp}.md"
+    
+    filepath = course_dir / filename
+    
+    # 写入文件
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"# {query}\n\n")
+        f.write(f"> 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"> 课程: {lesson}\n\n")
+        f.write("---\n\n")
+        f.write(result)
+    
+    return str(filepath)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="B.2 在线生成：RAG + 风格 Prompt")
     p.add_argument("query", type=str, help="用户请求")
@@ -431,6 +565,8 @@ def parse_args() -> argparse.Namespace:
                    help="bge 模型目录")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="打印检索结果和 Prompt 详情")
+    p.add_argument("--no-save", action="store_true",
+                   help="不保存输出到文件（默认会保存到 data/timelines/<课程拼音>/）")
     return p.parse_args()
 
 
@@ -458,27 +594,32 @@ def main() -> None:
 
     # 步骤 2+3: 检索
     enc = Encoder(args.model_dir)
-    segments = retrieve(args.query, intent, enc, args.top, args.rerank)
+    segments = retrieve(args.query, intent, enc, args.top, args.rerank, args.verbose)
 
-    if args.verbose:
-        print(f"检索到 {len(segments)} 段:")
-        for s in segments:
-            print(f"  {s['id']}  [{s['meta'].get('tags','')}]  "
-                  f"{s['text'][:80].replace(chr(10),' ')}……")
-        print()
+    if not args.verbose:
+        print(f"检索到 {len(segments)} 段")
 
     # 步骤 4: 组装 Prompt
     style = load_style()
     system, user = build_prompt(args.query, intent, segments, style, facts)
 
     if args.verbose:
-        print("=== SYSTEM ===")
-        print(system[:500], "\n...\n")
-        print("=== USER ===")
-        print(user[:1000], "\n...\n")
+        print(f"\n{'='*60}")
+        print("SYSTEM PROMPT (完整)")
+        print(f"{'='*60}")
+        print(system)
+        print(f"\n{'='*60}")
+        print("USER PROMPT (完整)")
+        print(f"{'='*60}")
+        print(user)
 
     # 步骤 5: 生成
-    print(f"模型生成中 ({cfg['model']}) ...\n")
+    if args.verbose:
+        print(f"\n{'='*60}")
+        print(f"调用 DeepSeek ({cfg['model']}) 生成...")
+        print(f"{'='*60}")
+    else:
+        print(f"模型生成中 ({cfg['model']}) ...\n")
     t0 = time.time()
     try:
         result = call_deepseek(cfg, system, user)
@@ -487,10 +628,24 @@ def main() -> None:
         sys.exit(1)
 
     dt = int(time.time() - t0)
-    print("=" * 50)
+    print(f"\n{'='*60}")
+    print("生成结果")
+    print(f"{'='*60}")
     print(result)
-    print("=" * 50)
-    print(f"\n生成耗时: {dt}s")
+    print(f"\n{'='*60}")
+    print(f"生成耗时: {dt}s")
+    print(f"{'='*60}")
+    
+    # 保存到文件
+    if not args.no_save:
+        saved_path = save_output(result, intent, args.query)
+        print(f"\n已保存到: {saved_path}")
+        
+        # 测试一下
+        if args.verbose:
+            print(f"\n[测试] 目录结构:")
+            print(f"  课程拼音: {lesson_name_to_pinyin(intent.get('lesson', ''))}")
+            print(f"  章节拼音: {lesson_name_to_pinyin(intent.get('chapter', ''))}")
 
 
 if __name__ == "__main__":

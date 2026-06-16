@@ -25,6 +25,22 @@ TIMELINE_DIR = PROJECT_ROOT / "data" / "timelines"
 sys.path.insert(0, str(PROJECT_ROOT))
 import generate
 
+
+def _split_course_chapter(lesson: str) -> tuple[str, str]:
+    """从 lesson 名提取课程名和章节名（和 build_timeline.py 一致）。"""
+    shishuo_chapters = {
+        "德行篇", "言语篇", "政事篇", "文学篇", "方正篇", "雅量篇",
+        "识鉴篇", "赏誉篇", "品藻篇", "规箴篇", "捷悟篇", "夙慧篇",
+        "豪爽篇", "容止篇", "自新篇", "俭啬篇", "汰侈篇", "忿狷篇",
+        "情礼篇", "黜免篇", "俭吝篇", "惑溺篇", "仇隙篇", "任诞篇",
+        "伤逝篇", "栖逸篇", "贤媛篇", "术解篇", "巧艺篇", "知惧篇",
+        "企羡篇",
+    }
+    for chapter in shishuo_chapters:
+        if chapter in lesson:
+            return ("世说新语精读", chapter)
+    return (lesson, lesson)
+
 # 配色
 INK = RGBColor(0x3A, 0x2F, 0x1F)        # 墨色
 WARM_CREAM = RGBColor(0xF5, 0xF0, 0xE8) # 暖米背景
@@ -94,13 +110,17 @@ _TIMING_TPL = (
 )
 
 
-def _embed_audio_post(out_path: Path, audio_map: dict[int, Path]) -> None:
+def _embed_audio_post(out_path: Path, audio_map: dict[int, Path],
+                     intro_duration_ms: int = 3000) -> None:
     """后处理 pptx：注入 PowerPoint 原生媒体对象，并设为自动播放。
 
     关键点：PowerPoint 导出视频只采集幻灯片上的自动播放媒体对象。
     这里按 python-pptx add_movie 生成的结构写入 MP3：video rel + 2007 media rel + poster image。
 
-    audio_map: {slide_index(1-based): audio_file_path}
+    Args:
+        out_path: 输出 PPTX 路径
+        audio_map: {slide_index(1-based): audio_file_path}
+        intro_duration_ms: 封面页停留时长（毫秒），默认 3000
     """
     import zipfile
     import shutil
@@ -116,7 +136,10 @@ def _embed_audio_post(out_path: Path, audio_map: dict[int, Path]) -> None:
         if audio_path.exists():
             mp3_map[sn] = audio_path.read_bytes()
             adv_times[sn] = int(MP3(audio_path).info.length * 1000)
-    adv_times[1] = 3000
+    
+    # 封面页停留时长（从外部传入，等于导入语音频时长）
+    if 1 not in adv_times:
+        adv_times[1] = intro_duration_ms  # 使用传入的时长
 
     slide_xmls = {}   # slide_num → xml_str
     slide_rels = {}   # slide_num → rels_xml_str
@@ -232,8 +255,18 @@ def _embed_audio_post(out_path: Path, audio_map: dict[int, Path]) -> None:
     tmp.unlink()
 
 
-def build_title_slide(prs: Presentation, timeline: dict) -> None:
-    """封面页。"""
+def build_title_slide(prs: Presentation, timeline: dict,
+                     intro_audio_path: Path = None) -> int:
+    """封面页。
+    
+    Args:
+        prs: PPT 对象
+        timeline: 时间轴数据
+        intro_audio_path: 导入语音频路径（用于获取时长）
+    
+    Returns:
+        封面页应停留的时长（毫秒），用于设置 advTm
+    """
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
     bg = slide.background
     bg.fill.solid()
@@ -243,18 +276,37 @@ def build_title_slide(prs: Presentation, timeline: dict) -> None:
     author = timeline.get("author", "")
     dynasty = timeline.get("dynasty", "")
 
+    # 标题
     _add_text_box(slide, 1, 1.8, 8, 1.2, title,
                   font_size=36, bold=True, color=WHITE)
+    # 作者朝代
     if author:
         _add_text_box(slide, 1, 3.0, 8, 0.6, f"{author} · {dynasty}",
                       font_size=16, color=GOLD)
 
-    # 装饰线
+    # 底部装饰线
     line = slide.shapes.add_shape(
         1, Inches(3), Inches(3.6), Inches(4), Inches(0),
     )
     line.line.color.rgb = GOLD
     line.line.width = Pt(1)
+    
+    # 导入语放到备注里
+    intro = timeline.get("intro", "")
+    if intro:
+        notes_slide = slide.notes_slide
+        notes_slide.notes_text_frame.text = intro
+    
+    # 计算封面页停留时长 = 导入语音频时长 + 1秒余量
+    intro_duration_ms = 3000  # 默认 3 秒
+    if intro_audio_path and intro_audio_path.exists():
+        try:
+            from mutagen.mp3 import MP3
+            intro_duration_ms = int(MP3(intro_audio_path).info.length * 1000)
+        except Exception:
+            pass
+    
+    return intro_duration_ms
 
 
 def build_sentence_slide(prs: Presentation, sentence: dict,
@@ -338,14 +390,22 @@ def build_pptx(timeline_path: Path, out_path: Path) -> None:
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
 
-    build_title_slide(prs, timeline)
-
     sentences = timeline.get("sentences", [])
     total = len(sentences)
     lesson_dir = timeline_path.parent
 
-    # 收集音频映射（slide 从 2 开始，slide 1 是封面）
+    # 封面页嵌入导入语音频
+    intro_narration = timeline.get("intro", "")
+    intro_audio = lesson_dir / "audio" / "00_intro.mp3"
+    
+    # 收集音频映射
     audio_map = {}
+    if intro_narration and intro_audio.exists():
+        audio_map[1] = intro_audio
+
+    # 封面页（导入语放到备注，停留时长 = 导入语音频时长）
+    intro_duration_ms = build_title_slide(prs, timeline, intro_audio)
+
     for i, s in enumerate(sentences, 1):
         build_sentence_slide(prs, s, i, total)
         audio_rel = s.get("audio", "")
@@ -356,10 +416,11 @@ def build_pptx(timeline_path: Path, out_path: Path) -> None:
 
     prs.save(str(out_path))
 
-    # 后处理嵌入音频
+    # 后处理嵌入音频（传入封面页停留时长）
     if audio_map:
-        _embed_audio_post(out_path, audio_map)
-        print(f"✓ {out_path}  ({total} 句内容 + 1 封面, {len(audio_map)} 句含音频)")
+        _embed_audio_post(out_path, audio_map, intro_duration_ms)
+        intro_info = "+ 1 封面导入语" if intro_narration else ""
+        print(f"✓ {out_path}  ({total} 句内容 + 1 封面{intro_info}, {len(audio_map)} 段音频)")
     else:
         print(f"✓ {out_path}  ({total} 句内容 + 1 封面)")
 
@@ -374,20 +435,33 @@ def parse_args():
 
 def main():
     args = parse_args()
-    lesson_name = generate._extract_lesson(args.query)
+    cfg = generate.load_config()
+    
+    # 意图解析（和 build_timeline.py 一致）
+    intent = generate.parse_intent(args.query, cfg)
+    if args.lesson:
+        intent["lesson"] = args.lesson
+    
+    lesson_name = intent.get("lesson", "") or generate._extract_lesson(args.query)
     if args.lesson:
         lesson_name = args.lesson
-
-    # 目录名使用拼音
-    lesson_dir_name = generate.lesson_name_to_pinyin(lesson_name)
-    lesson_dir = TIMELINE_DIR / lesson_dir_name
-    timeline_path = lesson_dir / "timeline.json"
-    if not timeline_path.exists():
-        print(f"✗ timeline.json 不存在: {timeline_path}")
+    
+    # 课程/章节拆分（和 build_timeline.py 一致）
+    course_name, chapter_name = _split_course_chapter(lesson_name)
+    course_dir = generate.lesson_name_to_pinyin(course_name)
+    chapter_dir = generate.lesson_name_to_pinyin(chapter_name)
+    lesson_dir = TIMELINE_DIR / course_dir / chapter_dir
+    
+    # 找最新的 timeline.json
+    timeline_files = sorted(lesson_dir.glob("*/timeline.json"), reverse=True)
+    if not timeline_files:
+        print(f"✗ timeline.json 不存在: {lesson_dir}")
         print("  请先运行: python3 script/build_timeline.py '{}'".format(args.query))
         sys.exit(1)
+    timeline_path = timeline_files[0]
+    print(f"使用: {timeline_path}")
 
-    out_path = Path(args.out) if args.out else lesson_dir / "slides.pptx"
+    out_path = Path(args.out) if args.out else timeline_path.parent / "slides.pptx"
     build_pptx(timeline_path, out_path.resolve())
 
 

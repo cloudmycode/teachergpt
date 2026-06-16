@@ -1,6 +1,35 @@
-# 通过微调大模型，实现AI语文老师 —— 技术方案与实现路径
+# 通过知识库和大模型微调，实现AI仿真老师 —— 技术方案与实现路径
 
 > 目标：用 ~1000 节课的 MP3 + Whisper 文本（带时间戳），做出一个尽量接近真实老师上课内容和风格的模型，并工程化进产品，让它能讲任意指定的语文课。
+
+### 读完这篇文档，你能学到什么
+
+这篇文档不仅是一份技术方案，也是一份 AI 应用开发的实战笔记。熟悉后你将掌握：
+
+**1. 大模型应用开发的核心模式**
+- **RAG（检索增强生成）**：如何用向量数据库 + 语义检索，让模型基于真实材料生成内容
+- **Prompt Engineering**：如何设计 System Prompt 让模型扮演特定角色（本项目是"仿真老师"）
+- **LoRA 微调**：当 Prompt 不够时，如何用少量数据微调模型"焊入"风格
+
+**2. 从数据到产品的完整链路**
+- 音频转录 → 文本清洗 → 结构化切分 → 向量化索引 → 在线检索 → Prompt 组装 → LLM 生成
+- 每个环节都有对应脚本，可直接运行
+
+**3. NLP 实战技能**
+- 语料清洗与结构化（正则、分句、实体提取）
+- 向量数据库（ChromaDB）的使用
+- Embedding 模型（BGE）与 Reranker 的配合
+- 风格统计与量化评估
+
+**4. 工程化思维**
+- 分阶段交付：先跑通再优化，RAG 先行，LoRA 兜底
+- 可验证的评估体系：口头禅命中率、句长分布、LLM-as-Judge
+- 增量更新与冷启动策略
+
+**5. 一个完整的 AI 项目**
+- 从需求分析到上线部署的全貌
+- 脚本调用关系与数据流转
+- 可复用的架构模式
 
 ---
 
@@ -375,14 +404,67 @@
 - metadata 里保存 lesson + tags + summary；文章库建好并回填 `source_refs` 后，再额外保存 para（从 `source_refs` 提取的段落号），用于精确过滤。
 
 **已实现**：`script/build_index.py`（调度 `bge/encode.py` 的 Encoder）。
-用法：`python3 script/build_index.py`（增量）| `--rebuild`（重建）| `--dry-run` | `--model-dir ./bge/models`。
+
+**输入**：
+- `data/chinese_units/<课程>/*.jsonl`（A.2 检索单元，每行一个 JSON 对象）
+- 每个 JSON 包含：`unit_id, text, lesson, tags, summary, source_refs, entities`
+
+**输出**：
+- `data/vecdb/`（ChromaDB 持久化向量库）
+- Collection 名称：`teacher_units`
+- 字段：
+  - `documents`：text（讲课原文，前面拼接了 entities + tags + summary 增强关键词密度）
+  - `embeddings`：bge-large-zh-v1.5 1024 维向量
+  - `metadatas`：lesson, t_start, tags, summary, paras（段落号，来自 source_refs）
+
+**用法**：
+```bash
+python3 script/build_index.py              # 增量索引（跳过已入库 unit_id）
+python3 script/build_index.py --rebuild     # 清空向量库后重建
+python3 script/build_index.py --dry-run     # 仅检查，不实际入库
+python3 script/build_index.py --model-dir ./bge/models  # 指定模型目录
+```
+
+**参数说明**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--src` | `data/chinese_units` | A.2 检索单元 JSONL 目录 |
+| `--db` | `data/vecdb` | ChromaDB 持久化路径 |
+| `--model-dir` | `bge/models` | BGE 模型缓存目录 |
+| `--batch-size` | 64 | 编码 batch size |
+| `--rebuild` | - | 清空向量库后重建 |
+| `--dry-run` | - | 仅检查，不实际入库 |
 
 **依赖安装**：
 ```bash
 pip3 install chromadb sentence-transformers huggingface-hub
 ```
 
-#### 步骤 4：加 reranker（精排模型）
+#### 步骤 4：索引测试
+构建索引后，用 `script/build_index_test.py` 验证入库效果：
+
+```bash
+# 完整测试（连接、元数据、语义检索）
+python3 script/build_index_test.py
+
+# 指定查询语句
+python3 script/build_index_test.py --query "朱自清的父爱"
+
+# 返回更多结果
+python3 script/build_index_test.py --top-k 10
+
+# 按课文过滤
+python3 script/build_index_test.py --lesson "背影"
+```
+
+**测试项**：
+1. **连接测试**：集合状态、总单元数
+2. **元数据完整性**：检查 lesson/tags/summary/paras 是否填充
+3. **语义检索**：给定 query 返回 top-k 结果及相似度
+4. **过滤检索**：按 lesson 元数据过滤
+
+#### 步骤 5：加 reranker（精排模型）
 向量召回（top-20）是"粗筛"，速度快但有时把不够相关的也召回了。再用 **`bge-reranker-v2-m3`** 这种交叉编码器，对 query 和每个候选段两两打分，重排后取真正最相关的 top-N（如 N=3~5）塞进 Prompt：
 
 "粗召回(向量, top-20) → 精排(reranker, top-5)"是 RAG 的标准两段式，能明显提升喂给 LLM 的上下文质量。
@@ -390,7 +472,7 @@ pip3 install chromadb sentence-transformers huggingface-hub
 **已实现**：`script/search.py` 支持 `--rerank` 启用两段式检索。首次运行会下载 `bge-reranker-v2-m3`（~2.3GB）。 
 > search.py为测试效果使用，不参与工程化。
 
-#### 步骤 5：增量更新
+#### 步骤 6：增量更新
 - 新转录的课随时 `col.add` 增量入库，不用全量重跑。
 - 只有在**换 embedding 模型**或**改切分粒度**时才需要全量重建索引。
 
@@ -477,7 +559,43 @@ pip3 install chromadb sentence-transformers huggingface-hub
 ```
 
 **已实现**：`script/generate.py`。端到端流程：意图解析（规则+模型）→ 向量检索（+可选reranker）→ 风格Prompt组装 → LLM生成。
-用法：`python3 script/generate.py "讲德行篇第25则"` | `--rerank` | `--lesson "世说新语精读"` | `-v`。
+
+**用法**：
+```bash
+# 基本用法
+python3 script/generate.py "讲德行篇第25则"
+
+# 详细模式（输出检索结果、完整 Prompt）
+python3 script/generate.py "讲德行篇第25则" -v
+
+# 指定参数
+python3 script/generate.py "讲德行篇第25则" --rerank --lesson "世说新语精读" --top 10
+```
+
+**详细模式（`-v`）输出内容**：
+1. **意图解析结果**：lesson、scope、intent
+2. **课文事实**（如有）：author、dynasty、source、excerpt、sentences 等
+3. **ChromaDB 查询详情**：
+   - 集合名、总单元数
+   - 查询文本、过滤条件
+   - 召回结果列表（unit_id、lesson、tags、summary、paras、相似度）
+4. **Rerank 精排结果**（如启用）：rerank 分数
+5. **最终检索结果**：top-N 段的完整信息
+6. **SYSTEM PROMPT（完整）**：风格设定 + 课文硬事实
+7. **USER PROMPT（完整）**：few-shot 片段 + 任务指令
+8. **生成结果**：模型输出
+
+**参数说明**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `query` | 必填 | 用户请求，如"讲《背影》第二段" |
+| `--lesson` | 自动解析 | 手动指定课文名 |
+| `--top` | 5 | 检索段数 |
+| `--rerank` | - | 启用 bge-reranker 精排 |
+| `--model-dir` | bge/models | BGE 模型目录 |
+| `-v` / `--verbose` | - | 详细输出模式 |
+
 > generate.py为效果测试代码，不参与工程化。
 
 **依赖安装**：
@@ -627,6 +745,39 @@ llamafactory-cli train qwen2.5-7b-instruct.yaml
 | 语义覆盖度 | 模型输出是否覆盖真实片段里的核心讲解点，而不是只在 embedding 上相似 | 人工/LLM-as-judge 打分 ≥4/5 |
 | 复述/照抄率 | 输出与检索片段的长 n-gram 重合比例 | 不长段照抄，连续重合超过 50 字需人工检查 |
 
+**已实现**：`script/evaluate.py`。用 `data/chinese_units` 真实讲解数据作为 ground truth 自动评估。
+
+**用法**：
+```bash
+# 抽样评估（从真实讲解随机抽 N 个，自评作为 baseline）
+python3 script/evaluate.py --sample 10
+
+# 指定课程评估
+python3 script/evaluate.py --sample 20 --course "世说新语精读"
+
+# 对比评估（传入模型输出，与随机真实讲解对比）
+python3 script/evaluate.py --compare "模型生成的讲解文本..." --course "世说新语精读"
+
+# 启用 LLM-as-Judge（需要 API key）
+python3 script/evaluate.py --sample 10 --llm-judge
+
+# 输出 JSON 格式
+python3 script/evaluate.py --sample 10 --json
+```
+
+**自动指标**：
+
+| 指标 | 说明 | 目标 |
+|------|------|------|
+| 长度比 | 模型输出长度 / 真实讲解长度 | 接近 1.0 |
+| 字符级 Jaccard | 两段文本的字符集合相似度 | 越高越好 |
+| 词级 Jaccard | 两段文本的词集合相似度 | 越高越好 |
+| 2-gram 重叠 | 2 字符 n-gram 重叠率 | 越高越好 |
+| 口头禅命中率 | 模型输出中包含风格档案里高频口头禅的比例 | ≥70% |
+| 口头禅过度使用率 | 每 100 字口头禅次数 vs 真实语料均值 | ≤1.5x |
+| 问句密度 | 模型输出 vs 真实讲解的问句数量对比 | 接近真实均值 |
+| LLM-as-Judge | 大模型评判综合评分（需 API key） | ≥4.0/5 |
+
 ### 6.3 人工盲评（最关键）
 
 #### 步骤 1：准备盲测评分表
@@ -650,488 +801,11 @@ llamafactory-cli train qwen2.5-7b-instruct.yaml
 
 ---
 
-## 7. 工程化进产品（最小架构）
+## 7. 端到端生成流程
 
-不需要照搬企业级 SaaS。单租户起步的最小可用架构：
+从用户输入到最终产出（PPT/HTML/视频），按执行顺序组织。
 
-```
-Client（一个输入框）
-  ↓
-API (FastAPI: server/app.py)
-  ├─ 输入长度/范围校验：太长则返回 need_scope，要求用户细化到段落/章节
-  ├─ 匿名任务创建：task_id + token + client_id
-  └─ 后台生成任务（SQLite 持久化状态）
-        ↓
-      build_timeline.py 生成 timeline + 音频
-        ↓
-      build_pptx.py 生成 PPTX
-        ↓
-      build_player.py 生成 HTML 预览
-        ↓
-      页面轮询任务状态 → 展示 HTML 预览 + 下载 PPT
-
-旁路:
-  - SQLite 任务库：data/output/tasks.sqlite3
-  - 时间轴/音频/PPT/播放器：data/timelines/
-  - 向量库 (Chroma/PGVector)
-  - 风格档案 (静态配置/DB)
-```
-
-### 7.1 技术选型
-
-| 组件 | 选型 | 理由 |
-|------|------|------|
-| API 框架 | FastAPI | Python 生态、自动文档、异步支持流式 |
-| 向量库 | Chroma | 本地零运维，几万条数据够用 |
-| Embedding 模型 | bge-large-zh-v1.5 | 中文语义检索，和 B.1 一致 |
-| Reranker | bge-reranker-v2-m3 | 精排，提升检索质量 |
-| LLM 推理 | vLLM | 高吞吐、支持流式、LoRA 热加载 |
-| 匿名任务 | SQLite | MVP 阶段持久化任务状态，页面关闭后可恢复 |
-| 缓存 | Redis（可选） | 相同 query 直接返回缓存结果 |
-
-### 7.2 项目结构（建议）
-
-```
-teacher-clone/
-├── server/                 # 当前 Web 服务
-│   ├── app.py              # FastAPI 入口，匿名任务、状态查询、下载/预览
-│   ├── requirements.txt    # Web 服务依赖
-│   └── static/
-│       └── index.html      # 单输入框页面
-├── core/                   # 核心逻辑
-│   ├── retriever.py       # 向量检索 + rerank
-│   ├── prompt_builder.py  # Prompt 组装
-│   └── style_profile.py   # 风格档案加载
-├── data/                   # 静态数据
-│   ├── style/             # 阶段 A.3 产出
-│   │   ├── style_stats.json
-│   │   ├── style_profile.json
-│   │   └── style_profile_batch_*.json
-│   ├── output/
-│   │   └── tasks.sqlite3  # 匿名任务状态库
-│   ├── timelines/         # timeline/audio/player.html/pptx 输出
-│   ├── segments.jsonl     # 阶段 A.2 产出
-│   └── vecdb/             # Chroma 向量库（运行时生成）
-├── models/                 # 模型权重
-│   ├── bge-large-zh-v1.5/
-│   └── qwen2.5-7b-lora/   # 阶段 C 产出
-└── config/
-    └── settings.yaml      # 配置（模型路径、API key 等）
-```
-
-### 7.3 API 接口设计（当前 server）
-
-#### POST /api/generate
-
-请求：
-```json
-{
-  "lesson": "木兰词 第一段",
-  "client_id": "浏览器本地生成的匿名 UUID"
-}
-```
-
-响应（创建任务）：
-```json
-{
-  "task_id": "uuid",
-  "token": "secret",
-  "status": "pending",
-  "message": "任务已提交，正在排队生成...",
-  "recover_url": "/task/{task_id}?token={secret}"
-}
-```
-
-如果输入内容太长且没有具体范围：
-```json
-{
-  "status": "need_scope",
-  "message": "输入内容较长，整篇生成会很慢。请具体到段落或章节..."
-}
-```
-
-#### GET /api/task/{task_id}?token=...
-
-查询任务状态。`token` 是匿名访问凭证，避免别人猜到 `task_id` 后下载文件。
-
-#### GET /api/preview/{task_id}?token=...
-
-返回生成好的 HTML 播放器，页面用 iframe 展示。
-
-#### GET /api/download/{task_id}?token=...
-
-下载生成好的 PPTX。
-
-#### GET /task/{task_id}?token=...
-
-恢复链接入口。用户关掉页面后，只要保存这个链接，就能回来查看生成结果。
-
-### 7.4 匿名用户与任务恢复
-
-用户不登录时，用两层机制恢复任务：
-
-1. 前端第一次打开页面时生成 `client_id`，保存到 `localStorage`。
-2. 每次生成任务时，后端生成 `task_id + token`，写入 `data/output/tasks.sqlite3`。
-3. 页面关闭后再次打开，前端从 `localStorage` 读取最近任务并轮询状态。
-4. 换浏览器或清缓存时，用户可通过 `/task/{task_id}?token=...` 恢复。
-
-`task_id` 只用于定位任务，`token` 才是访问凭证；下载和预览都必须带 token。
-
-### 7.5 长文本输入策略
-
-页面仍然只展示一个输入框，但后端要先做范围校验：
-
-- 用户输入短课文名或明确范围，如 `木兰词 第一段`、`出师表 第1-3段`：创建生成任务。
-- 用户粘贴很长文章，且没有出现段/章/节/则/句等范围：返回 `need_scope`，要求用户细化。
-- 这样避免整篇长文触发超长讲解、TTS 和 PPT 生成，导致等待时间过长。
-
-### 7.6 性能预估
-- 检索（向量 + rerank）：20~50ms。
-- Prompt 组装：1~2ms。
-- LLM 生成（流式）：按 token 速率约 30~50 token/s，300 字约 6~10 秒。
-- PPT 生成链路：取决于原文长度、逐句讲稿生成、TTS 和 PPT 写入，必须作为后台任务执行。
-- **总体验**：前端提交后立即拿到恢复链接；页面轮询状态，完成后展示 HTML 预览和 PPT 下载按钮。
-
-### 7.7 扩展路径
-- 后续要多老师/多租户、计费、Marketplace 再演进（可参考 design.gpt.md 里的扩展设想，但别在 MVP 阶段背这些包袱）。
-- SQLite 适合单机 MVP；多实例部署时改为 Redis/Postgres，并把生成文件放对象存储。
-
----
-
-## 11. 音视频 / PPT：讲解时原文高亮（句子 + 重点词）
-
-### 11.1 目标
-
-讲解过程中原文跟着走——讲到哪一句就高亮哪一句，讲到哪个重点词就弹出释义。本质是做一份**讲解时间轴**：句级按段落天然对齐，词级通过强制对齐精确到字。
-
-### 11.2 输入前提
-
-B.2（`generate.py`）按句输出以下字段后，本章管线才有起点：
-
-- `sentences[].text` — 原文
-- `sentences[].keywords[].word / note` — 重点词和释义
-- `sentences[].narration` — 每句的独立讲解文本（需在 B.2 新增"按句生成"模式）
-
-### 11.3 核心管线
-
-一条管线，三种输出（网页、PPT、MP4），共用同一份时间轴 JSON。
-
-```
-B.2 按句输出 sentences[].narration
-    ↓
-build_timeline.py（按句生成 + TTS + 对齐）
-    ↓
-timeline.json（含 narration / audio / duration / keyword_timings）
-    ↓
-渲染层（三选一或多选）
-    ├── HTML 页面（build_player.py）
-    ├── PPT（build_pptx.py，含嵌入旁白 + 自动播放）
-    └── MP4 视频（PowerPoint 导出或 PIL + ffmpeg）
-```
-
----
-
-#### 11.3.1 步骤 1：按句生成讲解
-
-`script/build_timeline.py` 逐句调 DeepSeek，带全文上下文 + 上一句结尾，输出到 `data/timelines/{拼音}/timeline.json`。每句拿到 `narration` 后进入下一步。
-
-**依赖安装**：
-```bash
-pip3 install edge-tts mutagen pypinyin
-```
-
-#### 11.3.2 步骤 2：TTS 合成
-
-每句 `narration` 调 edge-tts（微软免费云端 TTS），输出 `audio/01.mp3` 等，`duration` 用 mutagen 读 MP3 时长。
-
-> 依赖安装：`pip3 install edge-tts mutagen`
-
-#### 11.3.3 步骤 3：关键词时间戳
-
-当前实现采用**线性估时**：按关键词在 narration 文本中的字符位置占比 × 音频总时长估算。优点是零额外依赖、速度极快；缺点是同音字/发音差异会导致偏差。
-
-> WhisperX 强制对齐曾尝试过，但中文同音字误识别（如"静"→"镜"）导致全局对齐漂移，效果不如线性估时稳健。段落级对齐（先按段切分再对齐）可缓解但未作为主路径。
-
-#### 11.3.4 产出：timeline.json
-
-```json
-{
-  "title": "《诫子书》精讲",
-  "sentences": [
-    {
-      "id": 1,
-      "text": "非淡泊无以明志，非宁静无以致远。",
-      "keywords": [
-        {"word": "淡泊", "note": "恬淡寡欲，不追求名利"}
-      ],
-      "narration": "好，我们来看第一句…",
-      "audio": "audio/01.mp3",
-      "duration": 15.5,
-      "keyword_timings": [
-        {"word": "淡泊", "note": "恬淡寡欲，不追求名利", "time": 3.9, "start": 3.4}
-      ]
-    }
-  ]
-}
-```
-
-- 句级高亮天然对齐：第 N 段只讲第 N 句，播放第 N 段时高亮第 N 句。
-- 词级高亮用 `keyword_timings`：播放时监听 `currentTime >= kw.start`。
-
----
-
-### 11.4 三种渲染输出
-
-#### 11.4.1 HTML 播放器（`build_player.py`）
-
-一个 HTML 文件，加载 `timeline.json`，CSS + JS 驱动高亮。
-
-**用法**：
-
-```bash
-python3 script/build_player.py "诫子书 全文"
-python3 script/build_player.py "诫子书" --out player.html
-```
-
-**特性**：
-
-- 逐页卡片式：每页一句（原文 + 关键词卡片 + 译文）
-- 音频播放器：加载当前句 TTS 音频，播完自动跳下一句
-- 键盘控制：← → 切句，空格播放/暂停
-- 进度条：显示当前句播放进度
-
-浏览器直开，不需要编译，适合快速验证和在线课程。
-
-**依赖安装**：
-```bash
-# 无额外依赖，纯 HTML + JS
-```
-
-#### 11.4.2 PPT（`build_pptx.py`）
-
-`python-pptx` 逐句生成幻灯片，原文区 + 讲解区 + 关键词标注。**已实现嵌入旁白 + 自动播放**，导出视频可带声音。
-
-**用法**：
-
-```bash
-python3 script/build_pptx.py "诫子书 全文"
-python3 script/build_pptx.py "诫子书" --out 诫子书.pptx
-```
-
-**特性**：
-
-- 封面页 + 逐句内容页（原文大字 + 关键词卡片 + 译文）
-- 讲解放入备注（speaker notes）
-- 每页嵌入对应句的 TTS 音频（MP3 原样嵌入，按 PowerPoint/python-pptx 原生媒体结构写入）
-- 自动播放 timing：`<p:video>` + `delay="0"`，切到该页即播放
-- 每页时长 = 旁白时长（`transition advTm`）
-- 透明 1x1 图标媒体对象放在页面内极小尺寸（0,0,9144x9144），不显示图标
-- 用 PowerPoint 打开后「文件→导出→创建视频」即可得到带声 MP4
-
-**依赖安装**：
-```bash
-pip3 install python-pptx
-```
-
-> python-pptx 需指定中文字体（`run.font.name = "PingFang SC"` 等）。`run` 只能整段设样式，不能逐字高亮——所以要先把原文拆成普通段和高亮段再分别添加 `run`。
-
-#### 11.4.3 MP4 视频
-
-两种方式：
-
-1. **PowerPoint 导出**（推荐）：由 11.4.2 生成的 PPT 直接导出，自动带旁白。
-2. **PIL + ffmpeg**：每句一段短视频：PIL 渲染带高亮的静态图 → ffmpeg 合成图片 + 音频。
-
-```bash
-ffmpeg -loop 1 -i frame_01.jpg -i audio/01.mp3 \
-  -c:v h264 -tune stillimage -c:a aac -b:a 192k -shortest out_01.mp4
-```
-
-- 需要逐词动效时，按 `keyword_timings` 把一句切多张帧图（每个关键词时间点换一张），再用 ffmpeg 按时间拼接。
-- 多段拼接用 `ffmpeg concat`，各段编码参数（分辨率/帧率/采样率）必须一致。
-
-**三种输出适用场景**：
-
-| 输出 | 脚本 | 适合 |
-|---|---|---|
-| HTML | `build_player.py` | 快速验证、在线课程 |
-| PPT | `build_pptx.py` | 教师二次编辑、课堂放映、导出视频 |
-| MP4 | PPT 导出 / PIL+ffmpeg | 完整视频课、对外发布 |
-
----
-
-### 11.5 落地顺序
-
-#### 11.5.1 `build_timeline.py` — 讲解时间轴生成
-
-所有渲染输出的核心入口。输入课文查询，输出 `timeline.json` + 音频文件。
-
-**执行流程**：
-
-```
-DeepSeek 逐句生成 narration
-  → edge-tts 合成 mp3（audio/01.mp3 …）
-  → mutagen 读时长 → 写入 duration
-  → 线性估时对齐 → 写入 keyword_timings
-  → 输出 data/timelines/{课文名}/timeline.json
-```
-
-**用法**：
-
-```bash
-# 全量跑
-python3 script/build_timeline.py "诫子书 全文"
-
-# 调试：只跑前 3 句，打印讲解内容
-python3 script/build_timeline.py "诫子书" --max-sentences 3 --verbose
-
-# 只生成讲解文本，不合成音频（先看稿子质量）
-python3 script/build_timeline.py "诫子书" --skip-tts
-
-# 跳过对齐（不生成 keyword_timings）
-python3 script/build_timeline.py "诫子书" --skip-align
-```
-
-**JSON 缓存**：timeline.json 已存在时自动加载，跳过 DeepSeek 生成，直接跑 TTS + 对齐。要重新生成需先删文件。
-
-**输入依赖**：
-
-- 复用 `script/generate.py` 的意图解析、课文事实获取、语料检索、风格加载
-- 逐句调 DeepSeek API 生成 `narration`（带全文上下文 + 上一句结尾过渡）
-- `edge-tts` 提供云端 TTS 合成
-- 线性估时对齐（零额外依赖）
-
-**输出**：`data/timelines/{拼音}/` 目录下 `timeline.json` + `audio/*.mp3`。
-
-**依赖安装**：
-```bash
-# 复用 11.3.1 的依赖：edge-tts, mutagen, pypinyin
-```
-
-#### 11.5.2 HTML 播放器（`build_player.py`）
-
-**依赖安装**：
-```bash
-# 无额外依赖，纯 HTML + JS
-```
-
-#### 11.5.3 PPT 生成（`build_pptx.py`）
-
-**依赖安装**：
-```bash
-pip3 install python-pptx
-```
-
-### 11.6 脚本清单
-
-| 脚本 | 用途 | 依赖 |
-|---|---|---|
-| `script/generate.py` | B.2 在线生成：意图解析→检索→Prompt→LLM | DeepSeek API、BGE、ChromaDB |
-| `script/build_timeline.py` | 讲解时间轴生成：按句生成+TTS+对齐 | DeepSeek API、edge-tts、mutagen、pypinyin |
-| `script/build_player.py` | HTML 播放器生成 | 无 |
-| `script/build_pptx.py` | PPT 生成（含嵌入旁白+自动播放） | python-pptx |
-| `script/search.py` | 语义搜索：BGE 编码→ChromaDB 检索→可选 rerank | BGE、ChromaDB、bge-reranker |
-| `script/build_index.py` | 向量索引构建：批量编码+入库 | BGE、ChromaDB |
-| `script/split_units.py` | 检索单元切分 | 无 |
-| `script/style_stats.py` | 风格统计（程序统计） | jieba |
-| `script/style_profile.py` | 风格画像（大模型归纳） | 无 |
-| `script/transcribe.py` | 批量转录 | faster-whisper |
-| `script/test_keyword_pos.py` | 关键词定位调试 | faster-whisper |
-
-### 11.7 依赖关系
-
-- **B.2 `generate.py`**：提供 sentences（text/keywords/narration）
-- **`edge-tts`**：云端 TTS（免费）
-- **DeepSeek API**：生成 narration
-- **PIL / python-pptx / ffmpeg**：渲染层（按输出格式选用）
-- **BGE Embedding**：向量检索
-- **ChromaDB**：向量库
-- **bge-reranker**：精排（可选）
-
-### 11.8 部署环境要求
-
-#### 11.8.1 系统要求
-
-| 项目 | 最低 | 建议 |
-|---|---|---|
-| **Python** | 3.11+ | 3.11 |
-| **系统包** | `ffmpeg`（视频合成） | |
-| **内存** | 8GB | 16GB+ |
-| **磁盘** | 20GB | 50GB+（含模型 ~1.3GB、输出音频/视频） |
-| **GPU** | 不需要（纯 CPU） | |
-
-#### 11.8.2 Python 环境
-
-```bash
-# 创建虚拟环境（必须 Python 3.10+）
-python3.11 -m venv venv
-source venv/bin/activate
-
-# 项目依赖
-pip3 install -r requirements.txt
-```
-
-#### 11.8.3 模型文件
-
-首次运行会自动下载，或手动预下载：
-
-| 模型 | 位置 | 大小 | 下载方式 |
-|---|---|---|---|
-| BGE Embedding | `bge/models/` | ~1.3GB | `python3 bge/download_model.py --download` |
-
-#### 11.8.4 外部服务
-
-- **DeepSeek API**：需要 `api_key`，配置文件 `script/config.toml`
-- **edge-tts**：微软云端 TTS，免费，需联网
-- BGE 向量检索本地运行
-
-#### 11.8.5 服务器硬件要求（在线服务）
-
-在线服务只涉及 BGE 向量编码 + API 调用 + 文件生成，不需要 GPU：
-
-| 配置 | 最低要求 | 说明 |
-|---|---|---|
-| CPU | 2 核 | BGE 编码 + API 调用 |
-| 内存 | 4GB | BGE 模型加载约 1.5GB，留余量 |
-| 硬盘 | 20GB | vecdb + 依赖 + 生成文件 |
-| 网络 | 能出网 | 调 DeepSeek API、下载模型、Edge-TTS |
-| 系统 | Linux（Ubuntu/CentOS） | 不建议 Windows |
-
-#### 11.8.6 部署清单
-
-```bash
-# 1. 系统包
-apt install ffmpeg         # Ubuntu
-
-# 2. Python 3.11+
-python3.11 -m venv venv && source venv/bin/activate
-
-# 3. 项目依赖
-pip3 install -r requirements.txt
-pip3 install -r server/requirements.txt
-
-# 4. 下载 BGE 模型（服务器上直接下载，HuggingFace 公开模型）
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-zh-v1.5')"
-
-# 5. 配置 DeepSeek API Key
-cp script/config.example.toml script/config.toml
-# 编辑 config.toml 填入 api_key
-
-# 6. 验证（先跑生成，再跑 TTS + 对齐）
-python3 script/build_timeline.py "诫子书 全文" --skip-tts --skip-align
-python3 script/build_timeline.py "诫子书 全文"
-
-# 7. 生成 HTML 播放器 / PPT
-python3 script/build_player.py "诫子书 全文"
-python3 script/build_pptx.py "诫子书 全文"
-
-# 8. 启动 Web 服务
-python3 -m uvicorn server.app:app --host 0.0.0.0 --port 8000
-```
-
-#### 11.8.7 脚本执行顺序
-
-**在线生成流程**（Web 服务）：
+### 7.1 整体流程
 
 ```
 用户输入"木兰词 第一段"
@@ -1141,18 +815,19 @@ python3 -m uvicorn server.app:app --host 0.0.0.0 --port 8000
       ├── 创建匿名任务 task_id + token
       └── 写入 data/output/tasks.sqlite3
       ↓
-[script/build_timeline.py] 生成时间轴
-      ├── [script/generate.py] 获取课文信息
-      │     ├── parse_intent() - 解析意图
-      │     ├── fetch_lesson_facts() - 获取作者/朝代/句子
-      │     └── 生成 narration（讲解词）
-      │
-      ├── [tts/synthesize.py] edge-tts 合成音频
-      └── 输出 script.json + timeline.json
+[script/generate.py] 意图解析 + 语料检索 + 生成讲解词
+      ├── parse_intent() - 提取课文名、范围、意图
+      ├── fetch_lesson_facts() - 获取作者/朝代/句子
+      └── 输出 script.json（含 sentences[].text/keywords/narration）
+      ↓
+[script/build_timeline.py] 按句生成时间轴 + TTS
+      ├── 逐句调 DeepSeek 生成 narration（带上下文过渡）
+      ├── edge-tts 合成音频 → audio/01.mp3 ...
+      └── 输出 timeline.json（含 audio/duration/keyword_timings）
       ↓
 [script/build_pptx.py] 生成 PPT
-      ├── 读取 timeline.json
-      ├── 读取音频文件
+      ├── 读取 timeline.json + 音频
+      ├── 每页嵌入旁白 + 自动播放 timing
       └── 输出 {lesson}.pptx
       ↓
 [script/build_player.py] 生成 HTML 预览
@@ -1163,64 +838,336 @@ python3 -m uvicorn server.app:app --host 0.0.0.0 --port 8000
       └── 下载 /api/download/{task_id}?token=...
 ```
 
-**匿名任务恢复**：
+### 7.2 generate.py — 讲解词生成
 
-```
-浏览器首次访问
-      ↓
-localStorage 生成 client_id
-      ↓
-提交任务时把 client_id 发给 /api/generate
-      ↓
-后端返回 recover_url: /task/{task_id}?token=...
-      ↓
-页面关闭后：
-  - 同一浏览器：localStorage 自动恢复最近任务
-  - 换浏览器/清缓存：用户打开 recover_url 恢复
+复用 B.2 的完整流程：意图解析 → 课文事实获取 → 语料检索 → Prompt 组装 → LLM 生成。
+
+**用法**：
+```bash
+python3 script/generate.py "讲德行篇第25则"
+python3 script/generate.py "讲德行篇第25则" -v  # 详细输出
 ```
 
-**离线训练流程**（从原始音频构建语料库）：
+**输出**：`data/timelines/{课程拼音}/{章节拼音}/YYYYMMDD_HHMMSS.json`
 
-```
-原始音频文件 (.mp3)
-      ↓
-[transcribe.py] faster-whisper 转录 → 文本+时间戳
-      ↓
-[clean_transcript.py] 清洗转录文本
-      ├── 移除语气词（"嗯"、"那个"、"就是说"）
-      ├── 修正同音错别字
-      └── 标准化标点符号
-      ↓
-[split_units.py] 拆分讲解单元（句子级）
-      ↓
-[build_index.py] 构建向量索引（chromadb）
-      ↓
-[style_stats.py] 统计风格特征 → style_profile.json
+```json
+{
+  "title": "《世说新语·德行篇》第25则",
+  "sentences": [
+    {
+      "text": "华歆、王朗俱乘船避难。",
+      "keywords": [{"word": "避难", "note": "躲避灾祸"}],
+      "narration": "好，我们来看第一句..."
+    }
+  ],
+  "intro": "同学们，今天我们要学的是《世说新语·德行篇》第25则..."
+}
 ```
 
-**关键文件说明**：
+### 7.3 build_timeline.py — 时间轴生成
 
-| 文件 | 作用 |
-|------|------|
-| `generate.py` | 核心：意图解析、获取课文、生成讲解词 |
-| `build_timeline.py` | 在线生成入口：协调讲解词+TTS+时间轴 |
-| `build_pptx.py` | 生成 PPT 文件 |
-| `build_player.py` | 生成播放器 HTML |
-| `server/app.py` | Web 服务：提交任务、轮询状态、预览和下载 |
-| `server/static/index.html` | 单输入框页面：匿名恢复、状态轮询、预览展示 |
-| `data/output/tasks.sqlite3` | SQLite 任务状态库，运行时自动创建 |
-| `config.toml` | API Key、模型配置 |
+所有渲染输出的核心入口。输入查询，输出 `timeline.json` + 音频文件。
 
-#### 11.8.8 本地 vs 服务器文件
+**用法**：
+```bash
+python3 script/build_timeline.py "诫子书 全文"
+python3 script/build_timeline.py "诫子书" --max-sentences 3 --verbose
+python3 script/build_timeline.py "诫子书" --skip-tts  # 只生成讲稿
+```
+
+**执行流程**：
+```
+调用 generate.py 获取讲解词
+  → 逐句生成/补充 narration（带全文上下文 + 上一句结尾过渡）
+  → edge-tts 合成 mp3（audio/01.mp3 …）
+  → mutagen 读时长 → 写入 duration
+  → 线性估时对齐 → 写入 keyword_timings
+  → 输出 data/timelines/{课程拼音}/{章节拼音}/YYYYMMDD_HHMMSS/
+```
+
+**输出目录结构**：
+```
+data/timelines/{课程拼音}/{章节拼音}/YYYYMMDD_HHMMSS/
+├── script.json       # 纯文本讲稿（含 intro）
+├── timeline.json     # 完整时间轴（含音频路径、时长）
+├── audio/
+│   ├── 00_intro.mp3  # 导入语音频
+│   ├── 01.mp3        # 第1句音频
+│   └── ...
+└── slides.pptx       # 由 build_pptx.py 生成
+```
+
+**timeline.json 结构**：
+```json
+{
+  "title": "《诫子书》精讲",
+  "intro": "同学们...",
+  "sentences": [
+    {
+      "id": 1,
+      "text": "非淡泊无以明志，非宁静无以致远。",
+      "keywords": [{"word": "淡泊", "note": "恬淡寡欲"}],
+      "narration": "好，我们来看第一句...",
+      "audio": "audio/01.mp3",
+      "duration": 15.5,
+      "keyword_timings": [{"word": "淡泊", "start": 3.4}]
+    }
+  ]
+}
+```
+
+**依赖**：
+```bash
+pip3 install edge-tts mutagen pypinyin
+```
+
+### 7.4 build_pptx.py — PPT 生成
+
+`python-pptx` 逐句生成幻灯片，**已实现嵌入旁白 + 自动播放**。
+
+**用法**：
+```bash
+python3 script/build_pptx.py "诫子书 全文"
+python3 script/build_pptx.py "诫子书" --out 诫子书.pptx
+```
+
+**特性**：
+- 封面页 + 逐句内容页（原文大字 + 关键词卡片 + 译文）
+- 封面页备注放入导入语（intro），音频时长动态匹配
+- 每页嵌入对应句的 TTS 音频
+- 自动播放 timing：切到该页即播放，时长 = 旁白时长
+- 用 PowerPoint 打开后「文件→导出→创建视频」即可得到带声 MP4
+
+**依赖**：
+```bash
+pip3 install python-pptx
+```
+
+### 7.5 build_player.py — HTML 播放器
+
+一个 HTML 文件，加载 `timeline.json`，CSS + JS 驱动高亮。
+
+**用法**：
+```bash
+python3 script/build_player.py "诫子书 全文"
+```
+
+**特性**：
+- 逐页卡片式：每页一句（原文 + 关键词卡片 + 译文）
+- 音频播放器：加载当前句 TTS 音频，播完自动跳下一句
+- 键盘控制：← → 切句，空格播放/暂停
+- 进度条：显示当前句播放进度
+
+**依赖**：无（纯 HTML + JS）
+
+---
+
+## 8. Web 服务架构
+
+### 8.1 最小架构
+
+```
+Client（一个输入框）
+  ↓
+API (FastAPI: server/app.py)
+  ├─ 输入长度/范围校验：太长则返回 need_scope
+  ├─ 匿名任务创建：task_id + token + client_id
+  └─ 后台生成任务（SQLite 持久化状态）
+        ↓
+      build_timeline.py 生成 timeline + 音频
+        ↓
+      build_pptx.py 生成 PPTX
+        ↓
+      build_player.py 生成 HTML 预览
+        ↓
+      页面轮询任务状态 → 展示 HTML 预览 + 下载 PPT
+```
+
+### 8.2 技术选型
+
+| 组件 | 选型 | 理由 |
+|------|------|------|
+| API 框架 | FastAPI | Python 生态、自动文档、异步支持 |
+| 匿名任务 | SQLite | MVP 阶段持久化任务状态，页面关闭后可恢复 |
+| 缓存 | Redis（可选） | 相同 query 直接返回缓存结果 |
+
+### 8.3 API 接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/generate` | POST | 创建生成任务，返回 task_id + token |
+| `/api/task/{task_id}?token=...` | GET | 查询任务状态 |
+| `/api/preview/{task_id}?token=...` | GET | 返回 HTML 播放器 |
+| `/api/download/{task_id}?token=...` | GET | 下载 PPTX |
+| `/task/{task_id}?token=...` | GET | 恢复链接入口 |
+
+### 8.4 匿名用户与任务恢复
+
+用户不登录时，用两层机制恢复任务：
+
+1. 前端第一次打开页面时生成 `client_id`，保存到 `localStorage`。
+2. 每次生成任务时，后端生成 `task_id + token`，写入 `data/output/tasks.sqlite3`。
+3. 页面关闭后再次打开，前端从 `localStorage` 读取最近任务并轮询状态。
+4. 换浏览器或清缓存时，用户可通过 `/task/{task_id}?token=...` 恢复。
+
+`task_id` 只用于定位任务，`token` 才是访问凭证；下载和预览都必须带 token。
+
+### 8.5 项目结构
+
+```
+teacher-clone/
+├── server/
+│   ├── app.py              # FastAPI 入口
+│   ├── requirements.txt    # Web 服务依赖
+│   └── static/
+│       └── index.html      # 单输入框页面
+├── script/                 # 所有脚本
+├── data/
+│   ├── output/
+│   │   └── tasks.sqlite3  # 匿名任务状态库
+│   ├── timelines/         # timeline/audio/pptx 输出
+│   ├── style/             # 风格档案
+│   └── vecdb/             # Chroma 向量库
+└── config/
+    └── config.toml        # API Key、模型配置
+```
+
+### 8.6 扩展路径
+
+- SQLite 适合单机 MVP；多实例部署时改为 Redis/Postgres，并把生成文件放对象存储。
+- 后续要多老师/多租户、计费、Marketplace 再演进。
+
+---
+
+## 9. 部署环境
+
+### 9.1 系统要求
+
+| 项目 | 最低 | 建议 |
+|------|------|------|
+| **Python** | 3.11+ | 3.11 |
+| **系统包** | `ffmpeg` | |
+| **内存** | 8GB | 16GB+ |
+| **磁盘** | 20GB | 50GB+（含模型 ~1.3GB） |
+| **GPU** | 不需要 | |
+
+### 9.2 依赖安装
+
+```bash
+# 系统包
+apt install ffmpeg
+
+# Python 环境
+python3.11 -m venv venv && source venv/bin/activate
+
+# 项目依赖
+pip3 install -r requirements.txt
+pip3 install -r server/requirements.txt
+
+# 可选：TTS 和 PPT
+pip3 install edge-tts mutagen python-pptx pypinyin
+```
+
+### 9.3 模型文件
+
+| 模型 | 位置 | 大小 | 下载方式 |
+|---|---|---|---|
+| BGE Embedding | `bge/models/` | ~1.3GB | `python3 bge/download_model.py --download` |
+
+### 9.4 外部服务
+
+- **DeepSeek API**：需要 `api_key`，配置文件 `script/config.toml`
+- **edge-tts**：微软云端 TTS，免费，需联网
+- BGE 向量检索本地运行
+
+### 9.5 部署清单
+
+```bash
+# 1. 系统包
+apt install ffmpeg
+
+# 2. Python 环境
+python3.11 -m venv venv && source venv/bin/activate
+
+# 3. 项目依赖
+pip3 install -r requirements.txt
+pip3 install -r server/requirements.txt
+
+# 4. 下载 BGE 模型
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-zh-v1.5')"
+
+# 5. 配置 DeepSeek API Key
+cp script/config.example.toml script/config.toml
+# 编辑 config.toml 填入 api_key
+
+# 6. 验证
+python3 script/build_timeline.py "诫子书 全文" --skip-tts
+python3 script/build_timeline.py "诫子书 全文"
+python3 script/build_pptx.py "诫子书 全文"
+
+# 7. 启动 Web 服务
+python3 -m uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
+
+### 9.6 服务器硬件要求
+
+在线服务只涉及 BGE 向量编码 + API 调用 + 文件生成，不需要 GPU：
+
+| 配置 | 最低要求 | 说明 |
+|---|---|---|
+| CPU | 2 核 | BGE 编码 + API 调用 |
+| 内存 | 4GB | BGE 模型加载约 1.5GB，留余量 |
+| 硬盘 | 20GB | vecdb + 依赖 + 生成文件 |
+| 网络 | 能出网 | 调 DeepSeek API、下载模型、Edge-TTS |
+| 系统 | Linux | 不建议 Windows |
+
+### 9.7 本地 vs 服务器文件
 
 | 文件 | 需要上传到服务器 | 说明 |
 |---|---|---|
 | `script/` | ✅ | 脚本代码 |
 | `server/` | ✅ | Web 服务和静态页面 |
-| `data/vecdb/` | ✅ | 本地跑出来的向量库（~2.5MB） |
+| `data/vecdb/` | ✅ | 本地跑出来的向量库 |
 | `data/style_profile.json` | ✅ | 风格画像（如有） |
 | `config.toml` | ✅ | API Key 配置 |
 | `data/output/tasks.sqlite3` | ❌ | 运行时任务库，服务器自动创建 |
-| `data/timelines/` | 视情况 | 生成结果目录；迁移历史任务时需要上传 |
+| `data/timelines/` | 视情况 | 生成结果目录 |
 | `asr/models/` | ❌ | ASR 离线用，线上不需要 |
 | `bge/models/` | ❌ | 服务器上直接下载即可 |
+
+---
+
+## 10. 脚本清单
+
+| 脚本 | 用途 | 阶段 |
+|---|---|---|
+| `script/generate.py` | 讲解词生成：意图解析→检索→Prompt→LLM | B.2 |
+| `script/build_timeline.py` | 时间轴生成：按句生成+TTS+对齐 | 7.3 |
+| `script/build_pptx.py` | PPT 生成（含嵌入旁白+自动播放） | 7.4 |
+| `script/build_player.py` | HTML 播放器生成 | 7.5 |
+| `script/search.py` | 语义搜索测试 | B.1 |
+| `script/build_index.py` | 向量索引构建 | B.1 |
+| `script/build_index_test.py` | 索引测试 | B.1 |
+| `script/split_units.py` | 检索单元切分 | A.2 |
+| `script/style_stats.py` | 风格统计 | A.3 |
+| `script/style_profile.py` | 风格画像 | A.3 |
+| `script/evaluate.py` | 评估：模型 vs 真实讲解 | 6 |
+| `asr/transcribe.py` | 批量转录 | A.1 |
+
+---
+
+## 11. 离线训练流程
+
+从原始音频构建语料库：
+
+```
+原始音频文件 (.mp3)
+      ↓
+[asr/transcribe.py] faster-whisper 转录 → 文本+时间戳
+      ↓
+[script/split_units.py] 拆分讲解单元（句子级）
+      ↓
+[script/build_index.py] 构建向量索引（chromadb）
+      ↓
+[script/style_stats.py] + [script/style_profile.py] → 风格档案
+```

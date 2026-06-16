@@ -49,6 +49,19 @@ TIMELINE_DIR = DATA_DIR / "timelines"
 
 # ------------------------------------------------------------------- 逐句生成
 
+PER_INTRO_USER = """{few_shot}
+{context}
+
+请为这节课写一段**开头导入语**（50-100字）。
+
+要求：
+1. 用第一人称"我"的课堂口吻。
+2. 自然引入本课主题，可以抛出一个有趣的问题或悬念。
+3. 体现风格设定中的口头禅、提问方式。
+4. 让学生想继续听下去。
+
+请直接输出导入语，不要加标题，不要输出 JSON。"""
+
 PER_SENTENCE_USER = """{few_shot}
 {context}
 
@@ -61,8 +74,12 @@ PER_SENTENCE_USER = """{few_shot}
 1. 用第一人称"我"的课堂口吻。
 2. 如本句有重点词，逐个解读：读音、本义、语境义、用法。释义以背景信息为准。
 3. 然后把这句话串讲一遍，点出它好在哪、要体会什么。
-4. 上一句结尾为参考，开头的过渡语自然衔接（如"接着看下一句""好，我们再来看"），
-   但不要重复复述上一句内容。
+4. 上一句结尾为参考，开头自然过渡衔接，可以用不同的过渡方式：
+   - 直接承接上文："刚才我们讲了...接下来"
+   - 提出问题："那这个字是什么意思呢？"
+   - 简单过渡："接下来看""来看看这句"
+   - 也可以不用过渡语，直接开始讲解
+   **注意：不要每次都用"好"开头，要变化多样。**
 5. 不限字数，该展开就展开。
 6. **重要**：以下是本句所有的重点词，你必须逐个讲解，并且在讲到该词时用方括号 [ ] 标记。
    例如讲解"静"字时写成 [静]。注意：仅在讲解该词含义时标记，
@@ -120,6 +137,29 @@ def _build_context(
     return "\n".join(parts)
 
 
+def _build_intro_context(facts: dict) -> str:
+    """构建开头导入语的上下文。"""
+    parts = []
+    
+    author = facts.get("author", "")
+    source = facts.get("source", "")
+    dynasty = facts.get("dynasty", "")
+    parts.append(
+        f"你正在开始讲{f'《{source}》' if source else '课文'}（{author}，{dynasty}）。"
+    )
+    if facts.get("synopsis"):
+        parts.append(f"全文大意：{facts['synopsis']}")
+    
+    # 添加前几句原文作为参考
+    sentences = facts.get("sentences") or []
+    if sentences:
+        parts.append(f"\n课文开头几句：")
+        for i, s in enumerate(sentences[:3], 1):
+            parts.append(f"  {i}. {s.get('text', '')}")
+    
+    return "\n".join(parts)
+
+
 def build_per_sentence_prompt(
     sentence: dict,
     sentence_idx: int,
@@ -157,6 +197,35 @@ def build_per_sentence_prompt(
         context=context,
         sentence_text=sentence.get("text", ""),
         keyword_info=keyword_info,
+    )
+    return system, user
+
+
+def build_intro_prompt(
+    facts: dict,
+    style: dict,
+    segments: list[dict],
+) -> tuple[str, str]:
+    """构建开头导入语的 prompt。"""
+    system = _build_system(style)
+    context = _build_intro_context(facts)
+
+    few_shot = ""
+    if segments:
+        samples = "\n---\n".join(
+            f"片段{i + 1}: {s['text'][:200]}"
+            for i, s in enumerate(segments[:3])
+        )
+        few_shot = (
+            "以下是这位老师讲过的真实片段（参考风格，不要照抄）：\n"
+            "---\n"
+            f"{samples}\n"
+            "---\n\n"
+        )
+
+    user = PER_INTRO_USER.format(
+        few_shot=few_shot,
+        context=context,
     )
     return system, user
 
@@ -278,14 +347,53 @@ def align_by_ratio(narration: str, keywords: list, duration: float,
     return sorted(timings, key=lambda x: x["time"])
 
 
+# ------------------------------------------------------------------- 课程/章节拆分
+
+def _split_course_chapter(lesson: str) -> tuple[str, str]:
+    """从 lesson 名提取课程名和章节名。
+    
+    规则：
+      - "德行篇第25则" → ("世说新语精读", "德行篇")
+      - "言语篇" → ("世说新语精读", "言语篇")
+      - "木兰诗" → ("木兰诗", "木兰诗")
+      - "背影" → ("背影", "背影")
+    
+    Returns:
+        (课程名, 章节名)
+    """
+    # 世说新语各篇 → 课程=世说新语精读
+    shishuo_chapters = {
+        "德行篇", "言语篇", "政事篇", "文学篇", "方正篇", "雅量篇",
+        "识鉴篇", "赏誉篇", "品藻篇", "规箴篇", "捷悟篇", "夙慧篇",
+        "豪爽篇", "容止篇", "自新篇", "俭啬篇", "汰侈篇", "忿狷篇",
+        "情礼篇", "黜免篇", "俭吝篇", "惑溺篇", "仇隙篇", "任诞篇",
+        "伤逝篇", "栖逸篇", "贤媛篇", "术解篇", "巧艺篇", "知惧篇",
+        "企羡篇",
+    }
+    
+    for chapter in shishuo_chapters:
+        if chapter in lesson:
+            return ("世说新语精读", chapter)
+    
+    # 其他课文：课程=章节=lesson
+    return (lesson, lesson)
+
+
 # ------------------------------------------------------------------- 保存
 
 def _save_json(out_file: Path, lesson_name: str, facts: dict,
-               results: list) -> None:
+               results: list, intro_narration: str = "") -> None:
     """写入 JSON。
 
     保留 _positions（[词] 标记解析出的原文位置），
     供重跑对齐时精确去歧义，否则只能退回"取中部出现"的粗略猜测。
+    
+    Args:
+        out_file: 输出文件路径
+        lesson_name: 课文名
+        facts: 课文事实
+        results: 句子讲解列表
+        intro_narration: 开头导入语
     """
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +402,7 @@ def _save_json(out_file: Path, lesson_name: str, facts: dict,
         "author": facts.get("author", ""),
         "dynasty": facts.get("dynasty", ""),
         "source": facts.get("source", ""),
+        "intro": intro_narration,
         "sentences": results,
     }
     out_file.write_text(
@@ -379,13 +488,27 @@ def main() -> None:
         print("✗ 未找到 DeepSeek api_key。")
         sys.exit(1)
 
-    # 确定输出目录（使用拼音）
-    lesson_name = generate._extract_lesson(args.query)
+    # 步骤 1: 意图解析（先拿到真实课程名）
+    intent = generate.parse_intent(args.query, cfg)
+    intent["intent"] = "精读讲解"
+    if args.lesson:
+        intent["lesson"] = args.lesson
+    print(f"意图: {json.dumps(intent, ensure_ascii=False)}")
+
+    # 确定输出目录
+    # 从 lesson 提取课程名和章节名
+    # lesson 格式可能是：
+    #   - "木兰诗" → 课程=章节=木兰诗
+    #   - "世说新语精读" → 课程=世说新语精读, 章节=世说新语精读
+    #   - "德行篇第25则" → 课程=世说新语精读, 章节=德行篇
+    lesson_name = intent.get("lesson", "") or generate._extract_lesson(args.query)
     if args.lesson:
         lesson_name = args.lesson
-    # 目录名使用拼音，服务器兼容性更好
-    lesson_dir_name = generate.lesson_name_to_pinyin(lesson_name)
-    lesson_dir = TIMELINE_DIR / lesson_dir_name
+    
+    course_name, chapter_name = _split_course_chapter(lesson_name)
+    course_dir = generate.lesson_name_to_pinyin(course_name)
+    chapter_dir = generate.lesson_name_to_pinyin(chapter_name)
+    lesson_dir = TIMELINE_DIR / course_dir / chapter_dir
     script_file = lesson_dir / "script.json"
     timeline_file = lesson_dir / "timeline.json"
 
@@ -401,14 +524,9 @@ def main() -> None:
             "source": timeline.get("source", ""),
             "dynasty": timeline.get("dynasty", ""),
         }
+        intro_narration = timeline.get("intro", "")
     else:
-
-        # 步骤 1: 意图解析
-        intent = generate.parse_intent(args.query, cfg)
-        intent["intent"] = "精读讲解"
-        if args.lesson:
-            intent["lesson"] = args.lesson
-        print(f"意图: {json.dumps(intent, ensure_ascii=False)}")
+        intro_narration = ""
 
         # 步骤 2: 获取课文事实
         print("获取课文事实...")
@@ -435,14 +553,24 @@ def main() -> None:
         # 步骤 4: 加载风格
         style = generate.load_style()
 
-        # 步骤 5: 按段落分批生成 narration
+        # 步骤 5.0: 生成开头导入语
+        print("\n生成开头导入语...")
+        intro_system, intro_user = build_intro_prompt(facts, style, segments)
+        try:
+            intro_narration = generate.call_deepseek(cfg, intro_system, intro_user).strip()
+            print(f"  ✓ 导入语: {intro_narration[:80]}...")
+        except Exception as e:
+            print(f"  ✗ 导入语生成失败: {e}")
+            intro_narration = ""
+
+        # 步骤 5.1: 按段落分批生成 narration
         batch_size = args.batch_size
         batches = split_sentences_by_paragraph(sentences, batch_size)
         num_batches = len(batches)
         print(f"\n分 {num_batches} 批生成讲解（每批最多 {batch_size} 句）：")
 
         results = []
-        prev_narration = ""  # 跨批传递上下文
+        prev_narration = intro_narration  # 用导入语作为第一句的上下文
 
         for batch_idx, batch_sentences in enumerate(batches):
             batch_start = sum(len(b) for b in batches[:batch_idx])
@@ -488,7 +616,7 @@ def main() -> None:
 
     # 先生成别忘了存——万一 TTS 崩了稿子还在
     if not script_file.exists():
-        _save_json(script_file, lesson_name, facts, results)
+        _save_json(script_file, lesson_name, facts, results, intro_narration)
         print(f"✓ 讲稿已存: {script_file}")
 
     # 步骤 6: TTS + 对齐
@@ -496,7 +624,19 @@ def main() -> None:
         audio_dir = lesson_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        print("\nTTS 合成（edge-tts）...")
+        # 先合成导入语音频（id=0）
+        if intro_narration:
+            print("\nTTS 合成导入语...")
+            intro_mp3 = audio_dir / "00_intro.mp3"
+            if not intro_mp3.exists():
+                synthesize_audio(intro_narration, intro_mp3)
+                intro_dur = read_mp3_duration(intro_mp3)
+                print(f"  [0] 导入语 ({intro_dur:.1f}s)")
+            else:
+                intro_dur = read_mp3_duration(intro_mp3)
+                print(f"  [0] 导入语已存在 ({intro_dur:.1f}s)")
+
+        print("\nTTS 合成讲解...")
         for entry in results:
             idx = entry["id"]
             narration = entry.get("narration", "")
@@ -524,7 +664,7 @@ def main() -> None:
             entry["keyword_timings"] = []
 
     # 步骤 7: 输出 timeline.json
-    _save_json(timeline_file, lesson_name, facts, results)
+    _save_json(timeline_file, lesson_name, facts, results, intro_narration)
     print(f"✓ timeline: {timeline_file}")
 
     ok = sum(1 for r in results if r["narration"])
