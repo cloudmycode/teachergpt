@@ -327,18 +327,16 @@ async def _run_generation(task_id: str):
             message=f"正在获取《{lesson}》原文并分析分批策略...",
         )
 
-        # 1. 生成时间轴（含 TTS）
+        # 1. 一站式生成：讲稿 + 音频 + PPT（buildclass）
         # 后端会自动根据原文长度决定分批策略
         # 传 --lesson 明确指定文章名，确保目录名正确
-        timeline_args = [_build_generation_query(lesson), "--lesson", lesson]
+        build_args = [
+            _build_generation_query(lesson), "--lesson", lesson,
+            "--audio", "--pptx",
+        ]
 
-        # 运行 build_timeline（同步）
-        await asyncio.to_thread(_run_build_timeline, timeline_args)
-
-        _update_task(task_id, message="讲稿和音频生成完成，正在生成 PPT...")
-
-        # 2. 生成 PPT
-        pptx_path = await asyncio.to_thread(_run_build_pptx, [lesson])
+        # 运行 buildclass（同步）
+        pptx_path = await asyncio.to_thread(_run_buildclass, build_args)
 
         _update_task(task_id, message="PPT 生成完成，正在生成网页预览...")
         preview_path = await asyncio.to_thread(_run_build_player, [lesson])
@@ -360,33 +358,27 @@ async def _run_generation(task_id: str):
         )
 
 
-def _run_build_timeline(args: list) -> None:
-    """同步运行 build_timeline"""
+def _run_buildclass(args: list) -> str:
+    """同步运行 buildclass（讲稿 + 音频 + PPT），返回 PPT 路径"""
     import subprocess
-    script_path = PROJECT_ROOT / "script" / "build_timeline.py"
+    script_path = PROJECT_ROOT / "script" / "buildclass.py"
     cmd = [sys.executable, str(script_path)] + args
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     if result.returncode != 0:
-        raise RuntimeError(f"build_timeline 失败: {result.stderr or result.stdout}")
+        raise RuntimeError(f"buildclass 失败: {result.stderr or result.stdout}")
 
-
-def _run_build_pptx(args: list) -> str:
-    """同步运行 build_pptx，返回 PPT 路径"""
-    import subprocess
-    script_path = PROJECT_ROOT / "script" / "build_pptx.py"
-    cmd = [sys.executable, str(script_path)] + args
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
-    if result.returncode != 0:
-        raise RuntimeError(f"build_pptx 失败: {result.stderr or result.stdout}")
-
-    # 找到生成的 pptx 文件（目录名使用拼音）
+    # 找到生成的 pptx 文件（目录名使用拼音，可能是 课程/章节 两级）
     from script.generate import lesson_name_to_pinyin
     lesson_clean = _extract_lesson_name(args[0])
     lesson_dir_name = lesson_name_to_pinyin(lesson_clean)
-    pptx_dir = PROJECT_ROOT / "data" / "timelines" / lesson_dir_name
-    for f in pptx_dir.glob("*.pptx"):
-        return str(f)
-    raise FileNotFoundError(f"未找到生成的 PPT 文件: {pptx_dir}")
+    timelines_dir = PROJECT_ROOT / "data" / "timelines"
+    # 优先精确目录，否则全局递归找
+    candidates = list((timelines_dir / lesson_dir_name).rglob("*.pptx"))
+    if not candidates:
+        candidates = list(timelines_dir.rglob("*.pptx"))
+    if candidates:
+        return str(max(candidates, key=lambda f: f.stat().st_mtime))
+    raise FileNotFoundError(f"未找到生成的 PPT 文件: {timelines_dir / lesson_dir_name}")
 
 
 def _run_build_player(args: list) -> str:

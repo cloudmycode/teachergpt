@@ -245,7 +245,7 @@ def main():
     timeline_path = lesson_dir / "timeline.json"
     if not timeline_path.exists():
         print(f"✗ timeline.json 不存在: {timeline_path}")
-        print("  请先运行: python3 script/build_timeline.py '{}'".format(args.query))
+        print("  请先运行: python3 script/buildclass.py '{}' --audio".format(args.query))
         sys.exit(1)
 
     timeline = json.loads(timeline_path.read_text(encoding="utf-8"))

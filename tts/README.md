@@ -1,62 +1,69 @@
 # tts/
 
-独立的文本转语音小工具集，基于 `edge-tts`（微软 Edge 免费云端 TTS）
+文本转语音工具集。
 
 ## 目录
 
 ```
 tts/
-  synthesize.py      文本 → mp3，自动剥离 transcribe.py 输出的时间戳前缀
-  output/            默认输出目录（自动创建）
+  edge_tts.py   微软 Edge TTS（免费云端）
+  coze_tts.py   Coze TTS（商业 API，中文效果好）
+  output/       默认输出目录（自动创建）
 ```
 
 ## 依赖
 
 ```bash
-pip3 install edge-tts
+pip3 install edge-tts      # edge_tts.py
+pip3 install requests      # coze_tts.py
 ```
 
 ## 用法
 
-```bash
-cd /Users/wang/Project/video_en/tts
+### Edge TTS（微软免费）
 
-# 最小用法：把 ./output/<stem>.mp3 写出来
-python3.13 synthesize.py path/to/text.txt
+```bash
+# 基础用法
+python3 edge_tts.py path/to/text.txt
 
 # 切音色 / 语速
-python3.13 synthesize.py path/to/text.txt \
-    --voice zh-CN-YunxiNeural \
-    --rate "+0%"
+python3 edge_tts.py path/to/text.txt --voice zh-CN-YunxiNeural --rate "+0%"
 
 # 自定义输出名
-python3.13 synthesize.py path/to/text.txt --name my_clip
+python3 edge_tts.py path/to/text.txt --name my_clip
 # → output/my_clip.mp3
 ```
 
-## 与 asr/transcribe.py 配对使用
-
-`transcribe.py` 输出 `.txt` 时每行带时间戳前缀（`695.73s → 697.03s | But I'm sorry.`）。
-
-`synthesize.py` 会自动用正则把这层前缀剥掉，只把纯文本送去 TTS。
+### Coze TTS
 
 ```bash
-# 完整链路：音频 → 文本 → 翻译 → 音频
-python3 ../asr/transcribe.py some.mp3 --json
-# → some.txt（带时间戳）
+# 基础用法
+python3 coze_tts.py "你好"
+# → output.mp3
 
-# ... 自己翻译成中文得到 some.zh.txt ...
-
-python3 synthesize.py some.zh.txt
-# → output/some.zh.mp3
+# 指定输出文件
+python3 coze_tts.py "你好" out.mp3
 ```
 
-## 环境变量
+或在代码中调用：
 
-- `TTS_VOICE`：默认音色（默认 `zh-CN-XiaoxiaoNeural`，跟 `diaryofawimpykit/make_video.py` 一致）
-- `TTS_RATE`：默认语速（默认 `+10%`）
+```python
+from tts.coze_tts import synthesize
+synthesize("床前明月光", Path("out.mp3"), speed=0.9)
+```
 
-## 常用音色
+## 配置
+
+Coze TTS 的 API Key 配置在 `script/config.toml`：
+
+```toml
+[coze]
+api_key = "pat_填入你的Coze密钥"
+```
+
+也可通过环境变量 `COZE_API_KEY` 覆盖。
+
+## 常用 Edge 音色
 
 | 语言 | 音色 |
 |---|---|
@@ -66,8 +73,4 @@ python3 synthesize.py some.zh.txt
 | 英文（女）| `en-US-AriaNeural` |
 | 英文（男）| `en-US-GuyNeural` |
 
-更多音色：https://speech.microsoft.com/portal/voicegallery
-
-## 关于离线
-
-`edge-tts` 走微软云端，**需要联网**。如果要离线 TTS，把脚本里的 `import edge_tts` 换成 `piper-tts` 即可（piper 模型几十 MB，下载一次后本地推理）。
+更多：https://speech.microsoft.com/portal/voicegallery

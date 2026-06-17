@@ -6,3 +6,6 @@
 api_key = "sk-填入你的DeepSeek密钥"
 base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
+
+[coze]
+api_key = "pat_填入你的Coze密钥"

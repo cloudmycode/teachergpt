@@ -1,35 +1,29 @@
 #!/usr/local/bin/python3.13
 # -*- coding: utf-8 -*-
 """
-B.2 在线生成：解析意图 → 获取课文事实 → 检索相关讲解 → 组装 Prompt → LLM 生成。
+B.2 在线生成库：意图解析 / 课文事实 / 检索 / 风格 Prompt 组装。
 
-输入：用户自然语言请求（如"讲《背影》第二段"）
-输出：模拟老师风格的课堂讲解文字
+本模块是**库**（无 main），供 build_timeline.py 等编排脚本调用。
+所有“和大模型交互 + prompt 构建”都集中在这里：
 
-流程：
-  1. 意图解析（规则+模型）
-  1.5 获取课文硬事实（讲解类意图时调模型获取作者/朝代/出处/概要，注入 system）
-  2+3. 向量检索 + 可选 rerank
-  4. 风格 Prompt 组装（风格档案 + 课文事实 + few-shot 片段）
-  5. LLM 生成
+  - 配置 & 模型调用：load_config / call_deepseek
+  - 步骤 1   意图解析：parse_intent
+  - 步骤 1.5 课文事实：fetch_lesson_facts
+  - 步骤 2+3 检索：    retrieve
+  - 步骤 4   Prompt：  load_style / build_style_system / build_few_shot
+                       / build_intro_prompt / build_per_sentence_prompt
+  - 工具：            lesson_name_to_pinyin
 
 依赖：data/vecdb/（向量库）、data/style/style_profile.json（风格档案）
-
-用法：
-  python3 script/generate.py "讲世说新语德行篇第25则"
-  python3 script/generate.py "介绍一下顾荣" --lesson "世说新语精读"
-  python3 script/generate.py "怎么讲蹒跚这个词" --rerank
-  python3 script/generate.py "总结一下洛阳三俊" --verbose
 """
 
-import argparse
 import json
 import re
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -172,7 +166,8 @@ def fetch_lesson_facts(cfg: dict, query: str, intent: dict) -> "dict | None":
         '"excerpt":"指定范围的完整课文原文（指定了范围只输出该范围；否则输出核心段落）",'
         '"sentences":[{"text":"原文一句","translation":"该句白话翻译","paragraph":0,'
         '"keywords":[{"word":"重点字词","note":"释义/用法"}]}],'
-        '"synopsis":"课文内容概要（100字内）","keyPoints":["关键知识点1","关键知识点2"]}\n'
+        '"synopsis":"课文内容概要（100字内）","background":"写作背景（50字内，作者在什么境遇/动机下写的）",'
+        '"keyPoints":["关键知识点1","关键知识点2"]}\n'
         "要求：sentences 按原文顺序逐句排列，不要遗漏；keywords 是该句真正的考点字词，"
         "没有重点词的句子 keywords 可为空数组。paragraph 用于按段落分批生成，"
         "没有段落信息时可不填。如果某项不确定，留空字符串。只输出 JSON。"
@@ -181,7 +176,12 @@ def fetch_lesson_facts(cfg: dict, query: str, intent: dict) -> "dict | None":
     try:
         content = call_deepseek(cfg, FACTS_SYSTEM, user)
         content = content.strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(content)
+        data = json.loads(content)
+        # 注入篇名：用户实际要讲的文章名（如《卖油翁》），
+        # 避免把出处（source，如《归田录》）当成标题来念。
+        if isinstance(data, dict):
+            data["title"] = lesson
+        return data
     except Exception:
         return None
 
@@ -389,264 +389,197 @@ def load_style() -> dict:
     return {}
 
 
-def build_prompt(
-    query: str, intent: dict, segments: list[dict], style: dict,
-    facts: "dict | None" = None,
-) -> tuple[str, str]:
-    """组装 system + user prompt。"""
-    # System: 风格设定
-    style_lines = ["你是语文老师的课堂克隆，请严格遵循以下风格设定："]
+def build_style_system(style: dict) -> str:
+    """构建风格 system prompt（老师人格 + 口头禅/句式/禁忌等风格设定）。"""
+    lines = ["你是语文老师的课堂克隆，请严格遵循以下风格设定："]
     if style.get("persona"):
-        style_lines.append(f"人格：{style['persona']}")
-    for key in ["口头禅", "开场套路", "提问方式", "举例偏好",
-                "句式特征", "禁忌", "讲解结构"]:
+        lines.append(f"人格：{style['persona']}")
+    for key in [
+        "口头禅", "开场套路", "提问方式", "举例偏好",
+        "句式特征", "禁忌", "讲解结构",
+    ]:
         val = style.get(key)
         if val:
-            if isinstance(val, list):
-                style_lines.append(f"{key}：{'、'.join(val)}")
-            else:
-                style_lines.append(f"{key}：{val}")
+            val = "、".join(val) if isinstance(val, list) else val
+            lines.append(f"{key}：{val}")
+    return "\n".join(lines)
 
-    # 注入课文硬事实：作者、朝代、出处、原文等，作为不可违背的已知事实
-    if facts:
-        fact_lines = ["\n【课文硬事实——以下信息必须严格遵守，禁止自行编造】"]
-        if facts.get("author"):
-            fact_lines.append(f"作者：{facts['author']}")
-        if facts.get("dynasty"):
-            fact_lines.append(f"朝代：{facts['dynasty']}")
-        if facts.get("source"):
-            fact_lines.append(f"出处：{facts['source']}")
-        if facts.get("excerpt"):
-            fact_lines.append(f"原文：{facts['excerpt']}")
-        if facts.get("synopsis"):
-            fact_lines.append(f"内容概要：{facts['synopsis']}")
-        if facts.get("keyPoints"):
-            kp = "、".join(facts["keyPoints"])
-            fact_lines.append(f"关键知识点：{kp}")
 
-        # 逐句逐词讲解骨架：每句原文 + 翻译 + 重点字词释义
-        sentences = facts.get("sentences") or []
-        if sentences:
-            fact_lines.append(
-                "\n【逐句精讲骨架——讲解时必须逐句逐词覆盖，字词释义以此为准】"
-            )
-            for i, s in enumerate(sentences, 1):
-                line = f"{i}. 原句：{s.get('text', '')}"
-                if s.get("translation"):
-                    line += f"\n   译：{s['translation']}"
-                kws = s.get("keywords") or []
-                if kws:
-                    kw_str = "；".join(
-                        f"{k.get('word', '')}={k.get('note', '')}" for k in kws
-                    )
-                    line += f"\n   重点词：{kw_str}"
-                fact_lines.append(line)
-        style_lines.extend(fact_lines)
+def build_few_shot(segments: list[dict], limit: int = 3, maxlen: int = 200) -> str:
+    """把检索到的真实讲解片段拼成 few-shot 提示块（不要照抄，仅参考风格）。"""
+    if not segments:
+        return ""
+    samples = "\n---\n".join(
+        f"片段{i + 1}: {s['text'][:maxlen]}"
+        for i, s in enumerate(segments[:limit])
+    )
+    return (
+        "以下是这位老师讲过的真实片段（参考风格，不要照抄）：\n"
+        "---\n"
+        f"{samples}\n"
+        "---\n\n"
+    )
 
-    system = "\n".join(style_lines)
 
-    # User: few-shot + task
-    few_shot = ""
-    if segments:
-        samples = "\n---\n".join(
-            f"片段{i + 1}: {s['text'][:300]}" for i, s in enumerate(segments)
+PER_INTRO_USER = """{few_shot}
+{context}
+
+请为这节课写一段**开头导入语**（50-100字）。
+
+要求：
+1. 用第一人称"我"的课堂口吻。
+2. 简要介绍作者、朝代和写作背景（从上下文获取），自然引入本课主题，可以抛出一个有趣的问题或悬念。
+3. 体现风格设定中的口头禅、提问方式。
+4. 让学生想继续听下去。
+
+请直接输出导入语，不要加标题，不要输出 JSON。"""
+
+PER_SENTENCE_USER = """{few_shot}
+{context}
+
+现在请你讲解以下这句：
+
+原句：{sentence_text}
+{keyword_info}
+
+要求：
+1. 用第一人称"我"的课堂口吻。
+2. 如本句有重点词，逐个解读：读音、本义、语境义、用法。释义以背景信息为准。
+3. 然后**直接串讲**（不要说"我们把这句话串讲一下"之类的预告，直接开始）：
+   先一字不差地念出文言原句，再用"就是说"接白话翻译，
+   紧接着直接说出它的好处、学生要体会什么。**不要说"这句话好在哪呢","这个好处是什么呢","我们来分析一下"这类预设问和预告，直接说内容。**
+   例如："初，权谓吕蒙曰：'卿今当涂掌事，不可不学！'
+   就是说，当初孙权对吕蒙说：'你现在当权掌事，不能不学习啊！'"
+   不要跳过文言原句直接说白话。
+4. 上一句结尾为参考，开头自然过渡衔接，可以用不同的过渡方式：
+   - 直接承接上文："这句"
+   - 提出问题："这个字是什么意思呢？"
+   - 简单过渡："接下来看""来看看这句"
+   - 大部分情况可以不用过渡语，直接开始讲解
+   **注意：不要每次都用"好"开头，要变化多样。**
+5. 不限字数，需要展开时则展开讲。
+6. **重要**：以下是本句所有的重点词，你必须逐个讲解，并且在讲到该词时用方括号 [ ] 标记。
+   例如讲解"静"字时写成 [静]。注意：仅在讲解该词含义时标记，
+   开头引用原文（如"静以修身"）时不要标记。必须标记所有重点词，一个都不能漏。
+
+请直接输出讲解文本，不要加标题，不要输出 JSON。"""
+
+
+def _wrap_title(name: str) -> str:
+    """把篇名/出处规范化为带书名号形式；空值返回空串。"""
+    name = (name or "").strip().strip("《》").strip()
+    return f"《{name}》" if name else ""
+
+
+def _lesson_intro_line(facts: dict, lead: str) -> str:
+    """生成 "你正在讲《篇名》（作者，朝代，选自《出处》）。" 这类引导句。
+
+    篇名（title）优先，出处（source）仅作"选自"补充，避免把出处当成标题。
+    """
+    author = facts.get("author", "")
+    dynasty = facts.get("dynasty", "")
+    title_disp = _wrap_title(facts.get("title", "")) or _wrap_title(
+        facts.get("source", "")
+    )
+    src_disp = _wrap_title(facts.get("source", ""))
+    extra = f"，选自{src_disp}" if src_disp and src_disp != title_disp else ""
+    subject = title_disp or "课文"
+    meta = "，".join(p for p in [author, dynasty] if p)
+    if meta or extra:
+        return f"{lead}{subject}（{meta}{extra}）。"
+    return f"{lead}{subject}。"
+
+
+def _build_context(
+    sentence_idx: int,
+    total: int,
+    facts: dict,
+    prev_narration: str,
+) -> str:
+    """逐句讲解的上下文：课文信息 + 全文句列表（标出当前句）+ 上一句结尾。"""
+    parts = []
+
+    parts.append(_lesson_intro_line(facts, "你正在讲"))
+    if facts.get("synopsis"):
+        parts.append(f"全文大意：{facts['synopsis']}")
+
+    sentences = facts.get("sentences") or []
+    if sentences:
+        parts.append("\n课文全文（共 {} 句）：".format(len(sentences)))
+        for i, s in enumerate(sentences, 1):
+            marker = " ← 当前要讲" if i == sentence_idx else ""
+            parts.append(f"  {i}. {s.get('text', '')}{marker}")
+
+    if prev_narration and sentence_idx > 1:
+        tail = prev_narration[-120:]
+        parts.append(
+            f"\n上一句你讲完时的最后一段话：\"{tail}\"\n"
+            f"请从这里自然往下接，开头用老师的过渡语。"
         )
-        few_shot = (
-            "以下是这位老师讲过的真实片段（仅供参考风格，不要照抄）：\n"
-            "---\n"
-            f"{samples}\n"
-            "---\n\n"
+
+    return "\n".join(parts)
+
+
+def _build_intro_context(facts: dict) -> str:
+    """构建开头导入语的上下文。"""
+    parts = []
+
+    parts.append(_lesson_intro_line(facts, "你正在开始讲"))
+    if facts.get("synopsis"):
+        parts.append(f"全文大意：{facts['synopsis']}")
+    if facts.get("background"):
+        parts.append(f"写作背景：{facts['background']}")
+
+    # 添加前几句原文作为参考
+    sentences = facts.get("sentences") or []
+    if sentences:
+        parts.append(f"\n课文开头几句：")
+        for i, s in enumerate(sentences[:3], 1):
+            parts.append(f"  {i}. {s.get('text', '')}")
+
+    return "\n".join(parts)
+
+
+def build_per_sentence_prompt(
+    sentence: dict,
+    sentence_idx: int,
+    total: int,
+    facts: dict,
+    style: dict,
+    segments: list[dict],
+    prev_narration: str,
+) -> tuple[str, str]:
+    """逐句讲解 prompt（system 风格 + user 逐句任务）。"""
+    system = build_style_system(style)
+    context = _build_context(sentence_idx, total, facts, prev_narration)
+
+    kws = sentence.get("keywords") or []
+    keyword_info = ""
+    if kws:
+        keyword_info = "重点词：" + "、".join(
+            f"{k['word']}({k['note']})" for k in kws
         )
 
-    lesson = intent.get("lesson", "")
-    scope = intent.get("scope", "")
-    task_intent = intent.get("intent", "")
-    has_skeleton = bool(facts and facts.get("sentences"))
-
-    if has_skeleton:
-        user = (
-            f"{few_shot}"
-            f"用户请求：{query}\n"
-            + (f"课文：{lesson}，范围：{scope}，意图：{task_intent}\n\n" if lesson else "\n")
-            + "请按以下格式输出一堂**逐句逐词精讲**的课：\n\n"
-            "【课文信息】\n"
-            "列出作者、朝代、出处（引用 system 硬事实，禁止修改）。\n\n"
-            "【精讲正文】\n"
-            "按 system 中【逐句精讲骨架】的顺序往下讲，覆盖每一句、每个重点词：\n"
-            "- 篇幅短就**一句一句**地讲；篇幅长时可把意思连贯的几句**合成一段**、"
-            "**逐段**地讲，先引这一段原文再展开，但段内仍要把每个重点词逐个落到，不能跳过。\n"
-            "每一（句/段）都要做到：\n"
-            "1. 先完整引用这一句（或这一段）原文（照抄骨架，不得改字）。\n"
-            "2. 再**逐个**解读其中的重点字词——读音、本义、在这里的意思、词类活用/古今异义等，"
-            "释义以骨架为准，不要自行发挥成别的意思。\n"
-            "3. 然后把整句（整段）串讲一遍，点出它好在哪、要体会什么。\n"
-            "4. 全程用第一人称\"我\"的课堂口吻，自然带出风格设定里的口头禅、提问、追问、举例，"
-            "让解读听起来像真在上课，而不是查字典。\n\n"
-            "要求：\n"
-            "- **不限字数**，该展开就展开，宁可长也不要概括省略；每一句、每个重点词都要落到。\n"
-            "- 字词读音、释义、出处必须严格依据 system 提供的事实，宁可不展开也不要编。\n"
-            "- 句与句、段与段之间用老师的过渡语自然衔接。\n"
-            "- 结尾可用提问或互动引导。\n"
-        )
-    else:
-        user = (
-            f"{few_shot}"
-            f"用户请求：{query}\n"
-            + (f"课文：{lesson}，范围：{scope}，意图：{task_intent}\n\n" if lesson else "\n")
-            + "请按以下格式输出：\n\n"
-            "【课文信息】\n"
-            "列出课文的作者、朝代、出处、原文（直接引用 system 中【课文硬事实】的内容，禁止修改）。\n\n"
-            "【课堂讲解】\n"
-            "然后进入讲解，要求：\n"
-            "1. 用第一人称\"我\"，课堂口吻。\n"
-            "2. 体现风格设定中的口头禅、句式、提问方式。\n"
-            "3. 可参考 few-shot 片段的讲解结构，但不要照搬。\n"
-            "4. **不限字数**，把内容讲透，不要为了简短而概括省略。\n"
-            "5. 结尾可用提问或互动引导。\n"
-        )
-
+    user = PER_SENTENCE_USER.format(
+        few_shot=build_few_shot(segments),
+        context=context,
+        sentence_text=sentence.get("text", ""),
+        keyword_info=keyword_info,
+    )
     return system, user
 
 
-# ------------------------------------------------------------------- main
+def build_intro_prompt(
+    facts: dict,
+    style: dict,
+    segments: list[dict],
+) -> tuple[str, str]:
+    """开头导入语 prompt（system 风格 + user 导入任务）。"""
+    system = build_style_system(style)
+    context = _build_intro_context(facts)
 
-TIMELINES_DIR = PROJECT_ROOT / "data" / "timelines"
-
-
-def save_output(result: str, intent: dict, query: str) -> str:
-    """保存生成结果到 data/timelines/<课程拼音>/<章节拼音>/ 目录
-    
-    返回保存的文件路径
-    """
-    lesson = intent.get("lesson", "unknown")
-    lesson_pinyin = lesson_name_to_pinyin(lesson)
-    
-    # 从 query 中提取章节信息（如"德行篇第25则"、"009-第09讲"等）
-    chapter = intent.get("chapter", "")
-    if not chapter:
-        # 尝试从 query 中提取章节
-        import re
-        # 匹配"德行篇"、"第25则"、"009-第09讲"等格式
-        m = re.search(r"([\u4e00-\u9fa5]+篇|第?\d+-?第?\d+讲|第?\d+则)", query)
-        if m:
-            chapter = m.group(1)
-    
-    chapter_pinyin = lesson_name_to_pinyin(chapter) if chapter else "default"
-    
-    # 创建目录：data/timelines/<课程拼音>/<章节拼音>/
-    course_dir = TIMELINES_DIR / lesson_pinyin / chapter_pinyin
-    course_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 生成文件名：用时间戳
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}.md"
-    
-    filepath = course_dir / filename
-    
-    # 写入文件
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(f"# {query}\n\n")
-        f.write(f"> 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"> 课程: {lesson}\n\n")
-        f.write("---\n\n")
-        f.write(result)
-    
-    return str(filepath)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="B.2 在线生成：RAG + 风格 Prompt")
-    p.add_argument("query", type=str, help="用户请求")
-    p.add_argument("--lesson", type=str, default=None,
-                   help="手动指定课文名")
-    p.add_argument("--top", type=int, default=5, help="检索段数")
-    p.add_argument("--rerank", action="store_true", help="启用 reranker 精排")
-    p.add_argument("--model-dir", type=str, default=None,
-                   help="bge 模型目录")
-    p.add_argument("--verbose", "-v", action="store_true",
-                   help="打印检索结果和 Prompt 详情")
-    p.add_argument("--no-save", action="store_true",
-                   help="不保存输出到文件（默认会保存到 data/timelines/<课程拼音>/）")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    cfg = load_config()
-    if not cfg["api_key"]:
-        print("✗ 未找到 DeepSeek api_key。")
-        sys.exit(1)
-
-    # 步骤 1: 意图解析
-    intent = parse_intent(args.query, cfg)
-    if args.lesson:
-        intent["lesson"] = args.lesson
-
-    print(f"意图解析: {json.dumps(intent, ensure_ascii=False)}")
-    if args.verbose:
-        print(f"原始查询: {args.query}\n")
-
-    # 步骤 1.5: 获取课文硬事实（讲解类意图才触发）
-    facts = fetch_lesson_facts(cfg, args.query, intent)
-    if facts and args.verbose:
-        print(f"课文事实: {json.dumps(facts, ensure_ascii=False)}\n")
-
-    # 步骤 2+3: 检索
-    enc = Encoder(args.model_dir)
-    segments = retrieve(args.query, intent, enc, args.top, args.rerank, args.verbose)
-
-    if not args.verbose:
-        print(f"检索到 {len(segments)} 段")
-
-    # 步骤 4: 组装 Prompt
-    style = load_style()
-    system, user = build_prompt(args.query, intent, segments, style, facts)
-
-    if args.verbose:
-        print(f"\n{'='*60}")
-        print("SYSTEM PROMPT (完整)")
-        print(f"{'='*60}")
-        print(system)
-        print(f"\n{'='*60}")
-        print("USER PROMPT (完整)")
-        print(f"{'='*60}")
-        print(user)
-
-    # 步骤 5: 生成
-    if args.verbose:
-        print(f"\n{'='*60}")
-        print(f"调用 DeepSeek ({cfg['model']}) 生成...")
-        print(f"{'='*60}")
-    else:
-        print(f"模型生成中 ({cfg['model']}) ...\n")
-    t0 = time.time()
-    try:
-        result = call_deepseek(cfg, system, user)
-    except Exception as e:
-        print(f"✗ 生成失败: {e}")
-        sys.exit(1)
-
-    dt = int(time.time() - t0)
-    print(f"\n{'='*60}")
-    print("生成结果")
-    print(f"{'='*60}")
-    print(result)
-    print(f"\n{'='*60}")
-    print(f"生成耗时: {dt}s")
-    print(f"{'='*60}")
-    
-    # 保存到文件
-    if not args.no_save:
-        saved_path = save_output(result, intent, args.query)
-        print(f"\n已保存到: {saved_path}")
-        
-        # 测试一下
-        if args.verbose:
-            print(f"\n[测试] 目录结构:")
-            print(f"  课程拼音: {lesson_name_to_pinyin(intent.get('lesson', ''))}")
-            print(f"  章节拼音: {lesson_name_to_pinyin(intent.get('chapter', ''))}")
-
-
-if __name__ == "__main__":
-    main()
+    user = PER_INTRO_USER.format(
+        few_shot=build_few_shot(segments),
+        context=context,
+    )
+    return system, user
