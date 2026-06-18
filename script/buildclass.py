@@ -584,7 +584,7 @@ def _embed_audio_post(out_path: Path, audio_map: dict,
 
 def build_title_slide(C, prs, timeline: dict, intro_audio_path: Path = None) -> int:
     """封面页。返回封面页应停留的时长（毫秒）。"""
-    Inches, Pt = C["Inches"], C["Pt"]
+    Inches, Pt, PP_ALIGN = C["Inches"], C["Pt"], C["PP_ALIGN"]
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
     bg = slide.background
     bg.fill.solid()
@@ -594,25 +594,58 @@ def build_title_slide(C, prs, timeline: dict, intro_audio_path: Path = None) -> 
     author = timeline.get("author", "")
     dynasty = timeline.get("dynasty", "")
 
+    # 左上角品牌标识
+    _add_text_box(C, slide, 0.6, 0.5, 2, 0.3,
+                  "精讲课 AI",
+                  font_size=12, color=C["GOLD"], align=PP_ALIGN.LEFT)
+
+    # 标题居中
     _add_text_box(C, slide, 1, 1.8, 8, 1.2, title,
                   font_size=36, bold=True, color=C["WHITE"])
     if author:
         _add_text_box(C, slide, 1, 3.0, 8, 0.6, f"{author} · {dynasty}",
                       font_size=16, color=C["GOLD"])
 
+    # 分隔线
     line = slide.shapes.add_shape(
         1, Inches(3), Inches(3.6), Inches(4), Inches(0),
     )
     line.line.color.rgb = C["GOLD"]
     line.line.width = Pt(1)
 
+    # 二维码面板：右下角（data/qrcode.png 存在时自动添加）
+    qrcode_path = PROJECT_ROOT / "data" / "qrcode.png"
+    if qrcode_path.exists():
+        # 白底圆角卡片
+        _add_rounded_rect(C, slide, 7.4, 3.7, 1.5, 1.5, C["WHITE"])
+        # 二维码图片
+        slide.shapes.add_picture(
+            str(qrcode_path),
+            Inches(7.5), Inches(3.8), Inches(1.3), Inches(1.3),
+        )
+        # 二维码下方文字
+        _add_text_box(C, slide, 7.4, 5.15, 1.5, 0.25,
+                      "合作联系",
+                      font_size=10, color=C["GOLD"])
+
     intro = timeline.get("intro", "")
     if intro:
         slide.notes_slide.notes_text_frame.text = intro
 
-    _add_text_box(C, slide, 0, 5.1, 10, 0.35,
-                  "本课件由精讲课AI辅助生成，了解生成原理：www.jingjiangke.com",
-                  font_size=8, color=C["GOLD"])
+    # 底部技术说明（4 行）
+    footer_y = 4.35
+    _add_text_box(C, slide, 1, footer_y, 5.5, 0.25,
+                  "本课程由精讲课AI辅助生成",
+                  font_size=11, color=C["GOLD"], align=PP_ALIGN.LEFT)
+    _add_text_box(C, slide, 1, footer_y + 0.28, 5.5, 0.25,
+                  "基于名师课程知识库，结合大模型对讲解风格进行学习与生成",
+                  font_size=9, color=C["GOLD"], align=PP_ALIGN.LEFT)
+    _add_text_box(C, slide, 1, footer_y + 0.50, 5.5, 0.25,
+                  "了解生成原理：www.jingjiangke.com",
+                  font_size=9, color=C["GOLD"], align=PP_ALIGN.LEFT)
+    _add_text_box(C, slide, 1, footer_y + 0.70, 5.5, 0.25,
+                  "本PPT带备注和语音讲解可直接导出为视频",
+                  font_size=9, color=C["GOLD"], align=PP_ALIGN.LEFT)
 
     intro_duration_ms = 3000
     if intro_audio_path and intro_audio_path.exists():
@@ -812,7 +845,7 @@ def main() -> None:
 
     # ---- 步骤 4（可选）：PPTX ----
     pptx_path = (Path(args.pptx_out).resolve() if args.pptx_out
-                 else lesson_dir / "slides.pptx")
+                 else lesson_dir / f"{lesson_name}.pptx")
     if args.pptx:
         print(f"\n生成 PPT: {timeline_file}")
         build_pptx(timeline_file, pptx_path)
